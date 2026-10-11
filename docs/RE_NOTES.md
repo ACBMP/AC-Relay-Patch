@@ -255,3 +255,28 @@ flag is 0.
   +3/+11, ConnectionInfo::SetURL +12. The StationURL dtor's byte 15 is the
   low byte of a relocated address, which is invariant in 64 KiB steps.
 - The station-slot fix (ObjDup hook + SetURL) no longer depends on AddLocalURL.
+
+## How ACBMP.exe dies without an exception
+
+ACBMP.exe statically links the VS2008 CRT. Several of its fatal paths raise
+no exception, so a vectored handler never sees them:
+
+| Path | Ghidra VA (ACBMP.exe) | Ends in |
+|---|---|---|
+| `___report_gsfailure` (/GS cookie, code 0xC0000409) | 0x01ee11a4 | `SetUnhandledExceptionFilter(NULL)` + `kernel32!UnhandledExceptionFilter` + `TerminateProcess` |
+| `__invoke_watson` (invalid CRT parameter, 0xC0000417) | 0x01eb5c28 | same |
+| `_abort` (0x40000015; unhandled C++ exception, terminate) | 0x01ec466a | same |
+| `__purecall` | 0x01eb6318 | `_amsg_exit` -> `ExitProcess(255)` |
+
+All of these go through ACBMP.exe's kernel32 import slots, so the crash
+logger repoints those slots (`UnhandledExceptionFilter`, `ExitProcess`,
+`TerminateProcess`, `SetUnhandledExceptionFilter`) and logs the caller and stack.
+
+The game's own top-level filter (0x01b3c560, installed by 0x01b6e100) writes
+`My Documents\ACBMP_LOCAL DATE[ <asctime> ].dmp` (fallback `C:\test.dmp`),
+but only if `DBGHELP.DLL` is in the game folder. The paths above unset that
+filter first, so they leave no game dump, but Windows Error Reporting still
+records them (Event Viewer -> Application -> "Application Error", or
+`C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_ACBMP.exe_*`).
+The Quazal OSDK dump writer (0x01d116c0, `MM-DD-YYYY HH-MM-SS <name>.dmp`)
+is a separate, exception-driven path.
