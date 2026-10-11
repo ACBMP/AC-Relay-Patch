@@ -61,6 +61,25 @@ namespace ac_relay::relay
     // the game's URL race) when the direct path doesn't work.
     auto queue_relayed_probe_copy(const sockaddr_in& peer, const std::uint8_t* payload, std::size_t len) -> void;
 
+    // One address per peer. The game never expects a station at two
+    // addresses, but with relays on both sides it can see one twice: a peer
+    // that reaches us through OUR relay shows up at its public address
+    // (we rewrite the source), the same peer sending through ITS relay shows
+    // up at that relay's address. Two PRUDP connections to one station then
+    // coexist, which is the prime suspect for the launch crash.
+    //
+    // NAT probes carry the sender's RVCID, so we learn which station is
+    // behind which address. The first address that carries connection
+    // traffic for a station becomes its address; while that connection is
+    // alive, everything to or from another address of the same station is
+    // dropped (probes included, so the game's URL race never picks it).
+    auto note_probe_sender(const sockaddr_in& addr, std::uint32_t rvcid) -> void;
+    // Connection traffic (not a probe) arrived from addr.
+    auto note_session_from(const sockaddr_in& addr) -> void;
+    // True if addr is a second address of a station connected elsewhere.
+    // direction is only used for the log line ("to" / "from").
+    [[nodiscard]] auto is_second_address(const sockaddr_in& addr, const char* direction) -> bool;
+
     // Current allocation (host-order ip/port). If none exists yet and an
     // ALLOCATE is in flight, waits up to timeout_ms for ALLOCATED.
     [[nodiscard]] auto wait_allocation(std::uint32_t timeout_ms, std::uint32_t& relay_ip,

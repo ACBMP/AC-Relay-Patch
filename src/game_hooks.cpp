@@ -371,6 +371,7 @@ namespace ac_relay::game_hooks
         {
             bool ok = false;
             std::uint8_t msg = 0;
+            std::uint32_t rvcid = 0; // sender's
             std::uint32_t time = 0;
         };
 
@@ -381,6 +382,7 @@ namespace ac_relay::game_hooks
                 return m;
             m.ok = true;
             m.msg = data[10];
+            std::memcpy(&m.rvcid, data + 11, 4);
             std::memcpy(&m.time, data + 15, 4);
             return m;
         }
@@ -422,6 +424,17 @@ namespace ac_relay::game_hooks
                 bool wrap = false;
                 if (sock == relay::game_socket() && !relay::is_relay_address(dest))
                 {
+                    if (relay::is_second_address(dest, "to"))
+                    {
+                        // Can't just skip an overlapped send (the game waits
+                        // for it to complete): send it to the relay's control
+                        // port instead, which drops anything without its magic.
+                        WrapBuffer* w = wrap_buffer_for(op);
+                        std::memset(w->to, 0, sizeof(w->to));
+                        const sockaddr_in relay_addr = relay::server_address();
+                        std::memcpy(w->to, &relay_addr, sizeof(sockaddr_in));
+                        return s_send_to_hook.unsafe_thiscall<int>(self, buf, len, w->to, op);
+                    }
                     if (is_nat_probe(buf, len))
                     {
                         // Probe replies go back the way their request came
@@ -498,8 +511,19 @@ namespace ac_relay::game_hooks
                         from.sin_family = AF_INET;
                         from.sin_addr.s_addr = htonl(peer_ip);
                         from.sin_port = htons(peer_port);
-                        relay::note_relay_recv(from, payload, !is_nat_probe(data, payload));
-                        if (const ProbeMsg p = parse_probe(data, payload); p.ok && p.msg == 0)
+                        const ProbeMsg p = parse_probe(data, payload);
+                        if (p.ok)
+                            relay::note_probe_sender(from, p.rvcid);
+                        if (relay::is_second_address(from, "from"))
+                        {
+                            release_buffer(buffer);
+                            return nullptr;
+                        }
+                        const bool session = !is_nat_probe(data, payload);
+                        if (session)
+                            relay::note_session_from(from);
+                        relay::note_relay_recv(from, payload, session);
+                        if (p.ok && p.msg == 0)
                             relay::note_probe_request(from, p.time, true);
                         return buffer; // game sees a datagram from peer_ip:peer_port
                     }
@@ -514,8 +538,19 @@ namespace ac_relay::game_hooks
                 return nullptr;
             }
 
-            relay::note_direct_recv(from, !is_nat_probe(data, size));
-            if (const ProbeMsg p = parse_probe(data, size); p.ok && p.msg == 0)
+            const ProbeMsg p = parse_probe(data, size);
+            if (p.ok)
+                relay::note_probe_sender(from, p.rvcid);
+            if (relay::is_second_address(from, "from"))
+            {
+                release_buffer(buffer);
+                return nullptr;
+            }
+            const bool session = !is_nat_probe(data, size);
+            if (session)
+                relay::note_session_from(from);
+            relay::note_direct_recv(from, session);
+            if (p.ok && p.msg == 0)
                 relay::note_probe_request(from, p.time, false);
             return buffer;
         }

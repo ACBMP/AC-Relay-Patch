@@ -123,6 +123,20 @@ namespace ac_relay::relay
         std::uint16_t s_observed_port = 0; // host order
 
         std::unordered_map<std::uint64_t, Peer> s_peers;
+
+        // one address per peer (see relay.h)
+        constexpr std::uint64_t kStationAliveMs = 20'000;
+        constexpr std::size_t kMaxStations = 4096;
+        struct StationAddr
+        {
+            std::uint64_t addr = 0;        // peer_key of the address carrying its connection
+            std::uint64_t last_session = 0; // ms
+        };
+        bool s_one_address = true;
+        std::unordered_map<std::uint64_t, std::uint32_t> s_addr_rvcid; // peer_key -> RVCID
+        std::unordered_map<std::uint32_t, StationAddr> s_stations;     // RVCID -> its address
+        std::unordered_map<std::uint64_t, std::uint64_t> s_second_logged; // peer_key -> times dropped
+        std::uint64_t s_second_dropped = 0;
         std::deque<Delayed> s_delayed; // constant delay, so ordered by due
         std::deque<ProbeAsk> s_probe_asks; // ordered by arrival
         std::uint64_t s_probe_delay_ms = 80;
@@ -142,6 +156,17 @@ namespace ac_relay::relay
         [[nodiscard]] std::uint64_t peer_key(const sockaddr_in& a)
         {
             return (static_cast<std::uint64_t>(a.sin_addr.s_addr) << 16) | a.sin_port;
+        }
+
+        [[nodiscard]] std::string addr_str(const sockaddr_in& a);
+
+        [[nodiscard]] std::string key_str(std::uint64_t key)
+        {
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = static_cast<std::uint32_t>(key >> 16);
+            a.sin_port = static_cast<std::uint16_t>(key & 0xffff);
+            return addr_str(a);
         }
 
         [[nodiscard]] std::string ip_str(std::uint32_t host_ip)
@@ -251,12 +276,13 @@ namespace ac_relay::relay
 
             logger::info(std::format(
                 "relay stats: state={} alloc={} peers_via_relay={} in={} pkts/{} B out={} pkts/{} B control in={} out={} send_fail={} "
-                "probe replies via relay={} probe copies sent={} dropped (peer reachable directly)={}",
+                "probe replies via relay={} probe copies sent={} dropped (peer reachable directly)={} "
+                "second-address packets dropped={}",
                 state_name(s_state),
                 s_have_alloc ? std::format("{}:{}", ip_str(s_relay_ip), s_alloc_port) : std::string("none"),
                 via_relay, s_relay_in_pkts.load(), s_relay_in_bytes.load(), s_relay_out_pkts.load(),
                 s_relay_out_bytes.load(), s_control_in.load(), s_control_out.load(), s_control_send_fail.load(),
-                s_probe_replies_relayed, s_probe_copies_sent, s_probe_copies_dropped));
+                s_probe_replies_relayed, s_probe_copies_sent, s_probe_copies_dropped, s_second_dropped));
         }
 
         void worker()
@@ -410,6 +436,7 @@ namespace ac_relay::relay
             s_server_text = std::format("{} ({})", settings.server, addr_str(server));
             s_password = settings.password;
             s_probe_delay_ms = static_cast<std::uint64_t>(std::max(settings.relay_probe_delay_ms, 0));
+            s_one_address = settings.one_address_per_peer;
             s_initialized = true;
             s_stop = false;
         }
@@ -729,6 +756,88 @@ namespace ac_relay::relay
         s_cv.notify_all();
         if (logger::verbose())
             logger::debug(std::format("relay: probe copy to {} via relay in {} ms", addr_str(peer), s_probe_delay_ms));
+    }
+
+    auto note_probe_sender(const sockaddr_in& addr, std::uint32_t rvcid) -> void
+    {
+        if (rvcid == 0)
+            return;
+        std::lock_guard lock(s_mu);
+        if (!s_one_address)
+            return;
+        const std::uint64_t key = peer_key(addr);
+        auto it = s_addr_rvcid.find(key);
+        if (it == s_addr_rvcid.end())
+        {
+            if (s_addr_rvcid.size() >= kMaxStations)
+                return;
+            s_addr_rvcid.emplace(key, rvcid);
+            if (logger::verbose())
+                logger::debug(std::format("relay: {} is station RVCID {}", addr_str(addr), rvcid));
+        }
+        else if (it->second != rvcid)
+        {
+            // a different station behind the same address (rejoin, NAT
+            // reuse): the old station's pin no longer describes this address
+            logger::info(std::format("relay: {} now belongs to RVCID {} (was {})", addr_str(addr), rvcid, it->second));
+            it->second = rvcid;
+        }
+    }
+
+    auto note_session_from(const sockaddr_in& addr) -> void
+    {
+        std::lock_guard lock(s_mu);
+        if (!s_one_address)
+            return;
+        const std::uint64_t key = peer_key(addr);
+        const auto r = s_addr_rvcid.find(key);
+        if (r == s_addr_rvcid.end())
+            return;
+        const std::uint64_t now = now_ms();
+        auto it = s_stations.find(r->second);
+        if (it == s_stations.end())
+        {
+            if (s_stations.size() >= kMaxStations)
+                return;
+            it = s_stations.emplace(r->second, StationAddr{}).first;
+        }
+        StationAddr& st = it->second;
+        if (st.addr == key)
+        {
+            st.last_session = now;
+            return;
+        }
+        if (st.addr != 0 && now - st.last_session < kStationAliveMs)
+            return; // a second address: the hooks drop its traffic
+        logger::info(std::format("relay: station RVCID {} is connected at {}{}", r->second, addr_str(addr),
+                                 st.addr != 0 ? std::format(" (was {}, silent for {} s)", key_str(st.addr),
+                                                            (now - st.last_session) / 1000)
+                                              : std::string()));
+        st.addr = key;
+        st.last_session = now;
+    }
+
+    auto is_second_address(const sockaddr_in& addr, const char* direction) -> bool
+    {
+        std::lock_guard lock(s_mu);
+        if (!s_one_address || s_stations.empty())
+            return false;
+        const std::uint64_t key = peer_key(addr);
+        const auto r = s_addr_rvcid.find(key);
+        if (r == s_addr_rvcid.end())
+            return false;
+        const auto it = s_stations.find(r->second);
+        if (it == s_stations.end() || it->second.addr == 0 || it->second.addr == key ||
+            now_ms() - it->second.last_session >= kStationAliveMs)
+            return false;
+
+        ++s_second_dropped;
+        auto& n = s_second_logged[key];
+        if (n++ == 0 && s_second_logged.size() < kMaxStations)
+            logger::info(std::format("relay: station RVCID {} is connected at {}; dropping traffic {} its other "
+                                     "address {} (one address per peer)",
+                                     r->second, key_str(it->second.addr), direction, addr_str(addr)));
+        return true;
     }
 
     auto note_relay_send(const sockaddr_in& peer, std::size_t payload_len) -> void

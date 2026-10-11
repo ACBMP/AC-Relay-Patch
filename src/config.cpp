@@ -51,6 +51,8 @@ namespace ac_relay::config
             inipp::get_value(sec, "Password", s_settings.relay.password);
             if (std::string v; inipp::get_value(sec, "Verbose", v))
                 s_settings.relay.verbose = parse_bool(v);
+            if (std::string v; inipp::get_value(sec, "OneAddressPerPeer", v))
+                s_settings.relay.one_address_per_peer = parse_bool(v);
             if (std::string v; inipp::get_value(sec, "RelayProbeDelayMs", v))
             {
                 try
@@ -93,6 +95,8 @@ namespace ac_relay::config
             file << std::format("Verbose={}\n", s_settings.relay.verbose ? "true" : "false");
             file << "; wait (ms) before our own NAT probes also go via the relay; skipped if the peer reached us directly\n";
             file << std::format("RelayProbeDelayMs={}\n", s_settings.relay.relay_probe_delay_ms);
+            file << "; keep each peer at one address (drop its second path, e.g. its own relay while it uses ours)\n";
+            file << std::format("OneAddressPerPeer={}\n", s_settings.relay.one_address_per_peer ? "true" : "false");
             return true;
         }
         catch (const std::exception& e)

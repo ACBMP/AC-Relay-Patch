@@ -25,6 +25,11 @@ namespace ac_relay::config
         // meantime (then the relay copy is dropped). 0 = no wait. (Replies
         // always go back the way their request came.)
         int relay_probe_delay_ms = 80;
+
+        // Keep each peer at one address: once a peer's connection runs on
+        // one address, drop traffic to/from its other addresses (e.g. its own
+        // relay URL while it already reaches us through ours). See relay.h.
+        bool one_address_per_peer = true;
     };
 
     struct settings

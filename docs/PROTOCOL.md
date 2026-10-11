@@ -101,4 +101,18 @@ payload is 1488. The relay drops a RECV that would exceed this and counts it.
     direct if the peer was heard directly in the last 15 s, else through the
     relay if it ever came that way. Probes never change this path.
   - Unknown peers go direct.
+  - One address per peer (`OneAddressPerPeer`, default on). When both sides
+    have a relay, the same peer can reach the game at two addresses:
+    through our relay it appears at its public address (the RECV source),
+    and through its own relay at that relay's address. Vanilla never has a
+    station at two addresses, and two PRUDP connections to one station are
+    the prime suspect for the launch crash of 2026-10-11. Every probe
+    carries the sender's RVCID in bytes 11..14 (verified in a capture:
+    requests and replies each carry their own sender's). That tells the
+    patch which station is behind which address. The first address that
+    carries connection traffic for a station is pinned. While it stays
+    alive (traffic within 20 s), datagrams to or from any other address of
+    that station are dropped, probes included, so the game's URL race never
+    picks the second address. A dropped send goes to the relay's control
+    port, which discards it; the game needs its overlapped send to complete.
 - IPv4 only (the game is IPv4-only).
