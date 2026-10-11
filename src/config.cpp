@@ -91,7 +91,7 @@ namespace ac_relay::config
             file << std::format("Password={}\n", s_settings.relay.password);
             file << "; log every relayed/control packet to ac_relay.log\n";
             file << std::format("Verbose={}\n", s_settings.relay.verbose ? "true" : "false");
-            file << "; wait (ms) before a NAT probe reply also goes via the relay; skipped if the peer reached us directly\n";
+            file << "; wait (ms) before our own NAT probes also go via the relay; skipped if the peer reached us directly\n";
             file << std::format("RelayProbeDelayMs={}\n", s_settings.relay.relay_probe_delay_ms);
             return true;
         }

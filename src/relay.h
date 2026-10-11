@@ -46,7 +46,15 @@ namespace ac_relay::relay
     [[nodiscard]] auto should_relay(const sockaddr_in& peer) -> bool;
     auto note_relay_send(const sockaddr_in& peer, std::size_t payload_len) -> void;
 
-    // A NAT probe datagram the game sends directly to peer: if peer ever
+    // NAT probe bookkeeping, keyed by the requester's timestamp that the
+    // reply echoes. A request that reached us via the relay is answered via
+    // the relay, one that came direct is answered direct: each of the
+    // peer's URLs for us gets the answer (and ping) of its own path.
+    auto note_probe_request(const sockaddr_in& peer, std::uint32_t time, bool via_relay) -> void;
+    // True if this reply (to peer, echoing time) must go through the relay.
+    [[nodiscard]] auto route_probe_reply(const sockaddr_in& peer, std::uint32_t time) -> bool;
+
+    // A NAT probe request the game sends directly to peer: if peer ever
     // reached us through the relay, a copy goes through the relay
     // RelayProbeDelayMs later, unless the peer reached us directly within the
     // last 3 s. So the relay URL only gets probe answers (and can only win

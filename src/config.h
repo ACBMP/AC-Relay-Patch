@@ -20,9 +20,10 @@ namespace ac_relay::config
         // log every relayed / control packet
         bool verbose = false;
 
-        // NAT probe replies also go through the relay this much later than the
-        // direct copy, and only if the peer hasn't reached us directly in the
-        // meantime (then the relay copy is dropped). 0 = no wait.
+        // Our own NAT probe requests also go through the relay this much later
+        // than the direct copy, unless the peer reached us directly in the
+        // meantime (then the relay copy is dropped). 0 = no wait. (Replies
+        // always go back the way their request came.)
         int relay_probe_delay_ms = 80;
     };
 

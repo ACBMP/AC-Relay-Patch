@@ -364,6 +364,27 @@ namespace ac_relay::game_hooks
             return len >= 2 && (data[0] >> 4) == 5 && (data[1] >> 4) == 5;
         }
 
+        // URLProbe datagram (24 B): header up to byte 9, [10] msg (0 request,
+        // 1 reply), [11..14] sender RVCID, [15..18] the requester's time (a
+        // reply echoes the request's), all little-endian.
+        struct ProbeMsg
+        {
+            bool ok = false;
+            std::uint8_t msg = 0;
+            std::uint32_t time = 0;
+        };
+
+        [[nodiscard]] ProbeMsg parse_probe(const std::uint8_t* data, std::size_t len)
+        {
+            ProbeMsg m;
+            if (!is_nat_probe(data, len) || len < 19)
+                return m;
+            m.ok = true;
+            m.msg = data[10];
+            std::memcpy(&m.time, data + 15, 4);
+            return m;
+        }
+
         // ---- send path ---------------------------------------------------------
         // The send is overlapped: the buffer and destination must stay valid
         // until the game sees the op complete. Each socket has exactly one send
@@ -398,13 +419,25 @@ namespace ac_relay::game_hooks
                 const SOCKET sock = *reinterpret_cast<const SOCKET*>(self + kSockHandle);
                 const auto& dest = *reinterpret_cast<const sockaddr_in*>(to);
 
-                // NAT probes always go direct (the original send below); a
-                // delayed copy also goes through the relay. See
-                // relay::queue_relayed_probe_copy.
-                if (sock == relay::game_socket() && !relay::is_relay_address(dest) && is_nat_probe(buf, len))
-                    relay::queue_relayed_probe_copy(dest, buf, len);
-                else if (sock == relay::game_socket() && !relay::is_relay_address(dest) && relay::should_relay(dest) &&
-                         len + proto::kDataOverhead <= sizeof(WrapBuffer::data))
+                bool wrap = false;
+                if (sock == relay::game_socket() && !relay::is_relay_address(dest))
+                {
+                    if (is_nat_probe(buf, len))
+                    {
+                        // Probe replies go back the way their request came
+                        // (relay::route_probe_reply). Our own requests go
+                        // direct, plus a delayed relay copy
+                        // (relay::queue_relayed_probe_copy).
+                        const ProbeMsg p = parse_probe(buf, len);
+                        if (p.ok && p.msg == 1)
+                            wrap = relay::route_probe_reply(dest, p.time);
+                        else if (p.ok && p.msg == 0)
+                            relay::queue_relayed_probe_copy(dest, buf, len);
+                    }
+                    else
+                        wrap = relay::should_relay(dest);
+                }
+                if (wrap && len + proto::kDataOverhead <= sizeof(WrapBuffer::data))
                 {
                     WrapBuffer* w = wrap_buffer_for(op);
                     proto::encode_send_header(w->data, ntohl(dest.sin_addr.s_addr), ntohs(dest.sin_port));
@@ -466,6 +499,8 @@ namespace ac_relay::game_hooks
                         from.sin_addr.s_addr = htonl(peer_ip);
                         from.sin_port = htons(peer_port);
                         relay::note_relay_recv(from, payload, !is_nat_probe(data, payload));
+                        if (const ProbeMsg p = parse_probe(data, payload); p.ok && p.msg == 0)
+                            relay::note_probe_request(from, p.time, true);
                         return buffer; // game sees a datagram from peer_ip:peer_port
                     }
                 }
@@ -480,6 +515,8 @@ namespace ac_relay::game_hooks
             }
 
             relay::note_direct_recv(from, !is_nat_probe(data, size));
+            if (const ProbeMsg p = parse_probe(data, size); p.ok && p.msg == 0)
+                relay::note_probe_request(from, p.time, false);
             return buffer;
         }
 

@@ -77,6 +77,17 @@ namespace ac_relay::relay
             std::uint64_t last_relay = 0;
         };
 
+        struct ProbeAsk
+        {
+            std::uint64_t peer = 0; // peer_key
+            std::uint32_t time = 0; // requester's timestamp, echoed by the reply
+            std::uint16_t direct = 0;
+            std::uint16_t relayed = 0;
+            std::uint64_t at = 0;
+        };
+        constexpr std::uint64_t kProbeAskTtlMs = 5'000;
+        constexpr std::size_t kMaxProbeAsks = 512;
+
         struct Delayed
         {
             std::uint64_t due = 0;
@@ -113,13 +124,14 @@ namespace ac_relay::relay
 
         std::unordered_map<std::uint64_t, Peer> s_peers;
         std::deque<Delayed> s_delayed; // constant delay, so ordered by due
+        std::deque<ProbeAsk> s_probe_asks; // ordered by arrival
         std::uint64_t s_probe_delay_ms = 80;
 
         // counters (atomics: bumped on the game's network thread)
         std::atomic<std::uint64_t> s_relay_in_pkts{0}, s_relay_in_bytes{0};
         std::atomic<std::uint64_t> s_relay_out_pkts{0}, s_relay_out_bytes{0};
         std::atomic<std::uint64_t> s_control_in{0}, s_control_out{0}, s_control_send_fail{0};
-        std::uint64_t s_probe_copies_sent = 0, s_probe_copies_dropped = 0;
+        std::uint64_t s_probe_copies_sent = 0, s_probe_copies_dropped = 0, s_probe_replies_relayed = 0;
         std::uint64_t s_next_stats_at = 0;
 
         [[nodiscard]] std::uint64_t now_ms()
@@ -239,12 +251,12 @@ namespace ac_relay::relay
 
             logger::info(std::format(
                 "relay stats: state={} alloc={} peers_via_relay={} in={} pkts/{} B out={} pkts/{} B control in={} out={} send_fail={} "
-                "probe copies sent={} dropped (peer reachable directly)={}",
+                "probe replies via relay={} probe copies sent={} dropped (peer reachable directly)={}",
                 state_name(s_state),
                 s_have_alloc ? std::format("{}:{}", ip_str(s_relay_ip), s_alloc_port) : std::string("none"),
                 via_relay, s_relay_in_pkts.load(), s_relay_in_bytes.load(), s_relay_out_pkts.load(),
                 s_relay_out_bytes.load(), s_control_in.load(), s_control_out.load(), s_control_send_fail.load(),
-                s_probe_copies_sent, s_probe_copies_dropped));
+                s_probe_replies_relayed, s_probe_copies_sent, s_probe_copies_dropped));
         }
 
         void worker()
@@ -642,6 +654,58 @@ namespace ac_relay::relay
         if (p.last_direct != 0 && now_ms() - p.last_direct < kDirectFreshMs)
             return false;
         return p.last_relay != 0;
+    }
+
+    auto note_probe_request(const sockaddr_in& peer, std::uint32_t time, bool via_relay) -> void
+    {
+        std::lock_guard lock(s_mu);
+        const std::uint64_t now = now_ms();
+        while (!s_probe_asks.empty() &&
+               (now - s_probe_asks.front().at > kProbeAskTtlMs || s_probe_asks.size() >= kMaxProbeAsks))
+            s_probe_asks.pop_front();
+
+        const std::uint64_t key = peer_key(peer);
+        for (auto& a : s_probe_asks)
+            if (a.peer == key && a.time == time)
+            {
+                (via_relay ? a.relayed : a.direct)++;
+                return;
+            }
+        ProbeAsk a;
+        a.peer = key;
+        a.time = time;
+        a.at = now;
+        (via_relay ? a.relayed : a.direct)++;
+        s_probe_asks.push_back(a);
+    }
+
+    auto route_probe_reply(const sockaddr_in& peer, std::uint32_t time) -> bool
+    {
+        std::lock_guard lock(s_mu);
+        const std::uint64_t key = peer_key(peer);
+        for (auto& a : s_probe_asks)
+        {
+            if (a.peer != key || a.time != time)
+                continue;
+            // The game answers each request it received once, in arrival
+            // order; the same request often arrives both ways (the peer
+            // probes all our URLs at once). Direct first, then the relay.
+            if (a.direct > 0)
+            {
+                --a.direct;
+                return false;
+            }
+            if (a.relayed > 0)
+            {
+                --a.relayed;
+                if (!s_have_alloc || s_state == State::Stopped)
+                    return false;
+                ++s_probe_replies_relayed;
+                return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     auto queue_relayed_probe_copy(const sockaddr_in& peer, const std::uint8_t* payload, std::size_t len) -> void

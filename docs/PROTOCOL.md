@@ -70,11 +70,26 @@ payload is 1488. The relay drops a RECV that would exceed this and counts it.
 - Allocation ports accept datagrams from any source (open relay for inbound).
   Every datagram becomes a RECV to the owner.
 - Owner-side routing rule (patch), per peer ip:port:
-  - NAT probes (PRUDP stream type 5) are not routed. They always go direct.
-    If the peer has ever reached us through the relay, a copy also goes
-    through the relay `RelayProbeDelayMs` later (default 80). The copy is
-    dropped if the peer reached us directly in the last 3 s. So the relay
-    URL only gets probe answers when direct doesn't work.
+  - NAT probe replies (PRUDP stream type 5, byte 10 = 1) go back the way
+    their request came. The reply echoes the requester's timestamp (bytes
+    15..18), so it can be matched to the request. A request that reached us
+    through the relay is answered through the relay, one that came direct is
+    answered direct. So each of the peer's URLs for us gets the ping of its
+    own path. Direct wins when it works (it is faster), and the relay URL
+    always gets an answer when it is reachable.
+    - Live test 2026-10-11: dropping relay answers whenever the peer had
+      reached us directly starved the relay. A peer's probes reach us
+      directly through the lobby's reflected-address pushes, but that
+      address is only probed, not dialled. So the peer had a ping only on
+      an address it couldn't dial, and none on our relay URL, which it
+      could have.
+  - Our own probe requests (byte 10 = 0) go direct. If the peer has ever
+    reached us through the relay, a copy also goes through the relay
+    `RelayProbeDelayMs` later (default 80). The copy is dropped if the peer
+    reached us directly in the last 3 s. The copy is how a peer that only
+    reached us via our relay (a host without the patch, probing our relay
+    URL) gets pinged on its direct address, which we then reach through
+    the relay.
     - The copy can't simply be delayed. When the game starts a connect
       attempt, it re-adds its probes (`AddURLToProbe`), which resets their
       pings. A late relayed answer that lands right after that is the only
