@@ -13,6 +13,7 @@ set(SOURCES
     src/logger.cpp
     src/relay.cpp
     src/game_hooks.cpp
+    src/crash_log.cpp
     external/safetyhook/safetyhook.cpp
     external/safetyhook/Zydis.c
 )

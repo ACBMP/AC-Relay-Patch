@@ -1,5 +1,6 @@
 #include "ac_relay.h"
 #include "config.h"
+#include "crash_log.h"
 #include "game_hooks.h"
 #include "logger.h"
 #include "relay.h"
@@ -45,6 +46,7 @@ namespace
             return; // no log, but also nothing else: stay a no-op
 
         ac_relay::logger::info(std::format("base path: {}", base_path.string()));
+        ac_relay::crash_log::install();
 
         if (!settings.enabled)
         {
