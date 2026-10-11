@@ -72,8 +72,15 @@ payload is 1488. The relay drops a RECV that would exceed this and counts it.
 - Owner-side routing rule (patch), per peer ip:port:
   - NAT probes (PRUDP stream type 5) are not routed. They always go direct.
     If the peer has ever reached us through the relay, a copy also goes
-    through the relay `RelayProbeDelayMs` later (default 80). The game dials
-    the URL whose probe answered first, so a working direct path wins.
+    through the relay `RelayProbeDelayMs` later (default 80). The copy is
+    dropped if the peer reached us directly in the last 3 s. So the relay
+    URL only gets probe answers when direct doesn't work.
+    - The copy can't simply be delayed. When the game starts a connect
+      attempt, it re-adds its probes (`AddURLToProbe`), which resets their
+      pings. A late relayed answer that lands right after that is the only
+      ping the game has, so it dials the relay. Live test 2026-10-11:
+      direct replies at +30 ms, then the relay copy at +110 ms just after
+      the reset, and the game dialled the relay.
   - Connection traffic goes on the path that the peer's connection traffic
     last arrived on (relay RECV vs direct). Before there is any, it goes
     direct if the peer was heard directly in the last 15 s, else through the

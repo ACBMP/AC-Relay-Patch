@@ -35,6 +35,10 @@ namespace ac_relay::relay
         constexpr std::uint32_t kAttemptsBeforeUnreachable = 3;  // stop blocking URL publication after this
         constexpr std::size_t kMaxPeers = 4096;
         constexpr std::uint64_t kDirectFreshMs = 15'000;         // "heard directly lately"
+        // A relayed probe copy is dropped if the peer reached us directly this
+        // recently: the game answers probes every 500 ms, so a live direct path
+        // shows up well within this.
+        constexpr std::uint64_t kProbeDirectFreshMs = 3'000;
         constexpr std::size_t kMaxDelayed = 256;
 
         enum class State
@@ -76,6 +80,7 @@ namespace ac_relay::relay
         struct Delayed
         {
             std::uint64_t due = 0;
+            std::uint64_t peer = 0;             // peer_key
             std::vector<std::uint8_t> datagram; // complete SEND
         };
 
@@ -114,6 +119,7 @@ namespace ac_relay::relay
         std::atomic<std::uint64_t> s_relay_in_pkts{0}, s_relay_in_bytes{0};
         std::atomic<std::uint64_t> s_relay_out_pkts{0}, s_relay_out_bytes{0};
         std::atomic<std::uint64_t> s_control_in{0}, s_control_out{0}, s_control_send_fail{0};
+        std::uint64_t s_probe_copies_sent = 0, s_probe_copies_dropped = 0;
         std::uint64_t s_next_stats_at = 0;
 
         [[nodiscard]] std::uint64_t now_ms()
@@ -232,11 +238,13 @@ namespace ac_relay::relay
                 via_relay += p.session == Path::Relay ? 1 : 0;
 
             logger::info(std::format(
-                "relay stats: state={} alloc={} peers_via_relay={} in={} pkts/{} B out={} pkts/{} B control in={} out={} send_fail={}",
+                "relay stats: state={} alloc={} peers_via_relay={} in={} pkts/{} B out={} pkts/{} B control in={} out={} send_fail={} "
+                "probe copies sent={} dropped (peer reachable directly)={}",
                 state_name(s_state),
                 s_have_alloc ? std::format("{}:{}", ip_str(s_relay_ip), s_alloc_port) : std::string("none"),
                 via_relay, s_relay_in_pkts.load(), s_relay_in_bytes.load(), s_relay_out_pkts.load(),
-                s_relay_out_bytes.load(), s_control_in.load(), s_control_out.load(), s_control_send_fail.load()));
+                s_relay_out_bytes.load(), s_control_in.load(), s_control_out.load(), s_control_send_fail.load(),
+                s_probe_copies_sent, s_probe_copies_dropped));
         }
 
         void worker()
@@ -262,6 +270,20 @@ namespace ac_relay::relay
                 while (!s_delayed.empty() && s_delayed.front().due <= now)
                 {
                     const auto& d = s_delayed.front().datagram;
+                    // The peer reached us directly meanwhile: it can probe us
+                    // directly, so don't answer through the relay at all. A
+                    // late relay answer can land right after the game resets
+                    // its pings (AddURLToProbe on a new connect attempt) and
+                    // become the only answer it has, so it dials the relay.
+                    const auto it = s_peers.find(s_delayed.front().peer);
+                    if (it != s_peers.end() && it->second.last_direct != 0 &&
+                        now - it->second.last_direct < kProbeDirectFreshMs)
+                    {
+                        ++s_probe_copies_dropped;
+                        s_delayed.pop_front();
+                        continue;
+                    }
+                    ++s_probe_copies_sent;
                     if (s_have_alloc && send_control_locked(d.data(), static_cast<int>(d.size())))
                     {
                         --s_control_out; // counted as relayed data, not control
@@ -570,8 +592,9 @@ namespace ac_relay::relay
             if (s_peers.size() >= kMaxPeers)
                 return;
             it = s_peers.emplace(peer_key(peer), Peer{}).first;
-            logger::info(std::format("relay: peer {} reached us through the relay", addr_str(peer)));
         }
+        if (it->second.last_relay == 0)
+            logger::info(std::format("relay: peer {} reached us through the relay", addr_str(peer)));
         it->second.last_relay = now_ms();
         if (session && it->second.session != Path::Relay)
         {
@@ -585,15 +608,20 @@ namespace ac_relay::relay
     auto note_direct_recv(const sockaddr_in& peer, bool session) -> void
     {
         std::lock_guard lock(s_mu);
-        if (s_peers.empty())
+        if (!s_have_alloc)
             return;
-        // Only peers we've ever heard through the relay are tracked; unknown
-        // peers are direct by default.
-        const auto it = s_peers.find(peer_key(peer));
+        // Tracked for every peer: a direct probe can arrive before the
+        // peer's first relayed one, and must still suppress relayed probe
+        // copies (queue_relayed_probe_copy).
+        auto it = s_peers.find(peer_key(peer));
         if (it == s_peers.end())
-            return;
+        {
+            if (s_peers.size() >= kMaxPeers)
+                return;
+            it = s_peers.emplace(peer_key(peer), Peer{}).first;
+        }
         it->second.last_direct = now_ms();
-        if (session && it->second.session != Path::Direct)
+        if (session && it->second.session != Path::Direct && it->second.last_relay != 0)
         {
             logger::info(std::format("relay: peer {} connection path -> direct", addr_str(peer)));
             it->second.session = Path::Direct;
@@ -629,6 +657,7 @@ namespace ac_relay::relay
 
         Delayed d;
         d.due = now_ms() + s_probe_delay_ms;
+        d.peer = it->first;
         d.datagram.resize(proto::kDataOverhead + len);
         proto::encode_send_header(d.datagram.data(), ntohl(peer.sin_addr.s_addr), ntohs(peer.sin_port));
         std::memcpy(d.datagram.data() + proto::kDataOverhead, payload, len);
