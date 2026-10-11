@@ -10,11 +10,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <format>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace ac_relay::relay
 {
@@ -32,6 +34,8 @@ namespace ac_relay::relay
         constexpr std::uint64_t kStatsIntervalMs = 60'000;
         constexpr std::uint32_t kAttemptsBeforeUnreachable = 3;  // stop blocking URL publication after this
         constexpr std::size_t kMaxPeers = 4096;
+        constexpr std::uint64_t kDirectFreshMs = 15'000;         // "heard directly lately"
+        constexpr std::size_t kMaxDelayed = 256;
 
         enum class State
         {
@@ -55,9 +59,24 @@ namespace ac_relay::relay
             return "?";
         }
 
+        enum class Path : std::uint8_t
+        {
+            Unknown,
+            Direct,
+            Relay,
+        };
+
         struct Peer
         {
-            bool via_relay = false;
+            Path session = Path::Unknown;  // path of the last connection (non-probe) datagram
+            std::uint64_t last_direct = 0; // any datagram, ms
+            std::uint64_t last_relay = 0;
+        };
+
+        struct Delayed
+        {
+            std::uint64_t due = 0;
+            std::vector<std::uint8_t> datagram; // complete SEND
         };
 
         std::mutex s_mu;
@@ -88,6 +107,8 @@ namespace ac_relay::relay
         std::uint16_t s_observed_port = 0; // host order
 
         std::unordered_map<std::uint64_t, Peer> s_peers;
+        std::deque<Delayed> s_delayed; // constant delay, so ordered by due
+        std::uint64_t s_probe_delay_ms = 80;
 
         // counters (atomics: bumped on the game's network thread)
         std::atomic<std::uint64_t> s_relay_in_pkts{0}, s_relay_in_bytes{0};
@@ -208,7 +229,7 @@ namespace ac_relay::relay
         {
             std::size_t via_relay = 0;
             for (const auto& [k, p] : s_peers)
-                via_relay += p.via_relay ? 1 : 0;
+                via_relay += p.session == Path::Relay ? 1 : 0;
 
             logger::info(std::format(
                 "relay stats: state={} alloc={} peers_via_relay={} in={} pkts/{} B out={} pkts/{} B control in={} out={} send_fail={}",
@@ -225,11 +246,30 @@ namespace ac_relay::relay
 
             while (!s_stop)
             {
-                s_cv.wait_for(lock, std::chrono::milliseconds(250));
+                std::uint64_t wait_ms = 250;
+                if (!s_delayed.empty())
+                {
+                    const std::uint64_t t = now_ms();
+                    wait_ms = s_delayed.front().due > t ? std::min<std::uint64_t>(wait_ms, s_delayed.front().due - t) : 0;
+                }
+                if (wait_ms)
+                    s_cv.wait_for(lock, std::chrono::milliseconds(wait_ms));
                 if (s_stop)
                     break;
 
                 const std::uint64_t now = now_ms();
+
+                while (!s_delayed.empty() && s_delayed.front().due <= now)
+                {
+                    const auto& d = s_delayed.front().datagram;
+                    if (s_have_alloc && send_control_locked(d.data(), static_cast<int>(d.size())))
+                    {
+                        --s_control_out; // counted as relayed data, not control
+                        ++s_relay_out_pkts;
+                        s_relay_out_bytes += d.size() - proto::kDataOverhead;
+                    }
+                    s_delayed.pop_front();
+                }
 
                 switch (s_state)
                 {
@@ -335,6 +375,7 @@ namespace ac_relay::relay
             s_server = server;
             s_server_text = std::format("{} ({})", settings.server, addr_str(server));
             s_password = settings.password;
+            s_probe_delay_ms = static_cast<std::uint64_t>(std::max(settings.relay_probe_delay_ms, 0));
             s_initialized = true;
             s_stop = false;
         }
@@ -517,7 +558,7 @@ namespace ac_relay::relay
         }
     }
 
-    auto note_relay_recv(const sockaddr_in& peer, std::size_t payload_len) -> void
+    auto note_relay_recv(const sockaddr_in& peer, std::size_t payload_len, bool session) -> void
     {
         ++s_relay_in_pkts;
         s_relay_in_bytes += payload_len;
@@ -529,17 +570,19 @@ namespace ac_relay::relay
             if (s_peers.size() >= kMaxPeers)
                 return;
             it = s_peers.emplace(peer_key(peer), Peer{}).first;
+            logger::info(std::format("relay: peer {} reached us through the relay", addr_str(peer)));
         }
-        if (!it->second.via_relay)
+        it->second.last_relay = now_ms();
+        if (session && it->second.session != Path::Relay)
         {
-            it->second.via_relay = true;
-            logger::info(std::format("relay: peer {} path direct -> RELAY", addr_str(peer)));
+            logger::info(std::format("relay: peer {} connection path -> RELAY", addr_str(peer)));
+            it->second.session = Path::Relay;
         }
         if (logger::verbose())
-            logger::debug(std::format("relay: RECV {} B from {}", payload_len, addr_str(peer)));
+            logger::debug(std::format("relay: RECV {} B from {}{}", payload_len, addr_str(peer), session ? "" : " (probe)"));
     }
 
-    auto note_direct_recv(const sockaddr_in& peer) -> void
+    auto note_direct_recv(const sockaddr_in& peer, bool session) -> void
     {
         std::lock_guard lock(s_mu);
         if (s_peers.empty())
@@ -547,10 +590,13 @@ namespace ac_relay::relay
         // Only peers we've ever heard through the relay are tracked; unknown
         // peers are direct by default.
         const auto it = s_peers.find(peer_key(peer));
-        if (it != s_peers.end() && it->second.via_relay)
+        if (it == s_peers.end())
+            return;
+        it->second.last_direct = now_ms();
+        if (session && it->second.session != Path::Direct)
         {
-            it->second.via_relay = false;
-            logger::info(std::format("relay: peer {} path RELAY -> direct", addr_str(peer)));
+            logger::info(std::format("relay: peer {} connection path -> direct", addr_str(peer)));
+            it->second.session = Path::Direct;
         }
     }
 
@@ -560,7 +606,36 @@ namespace ac_relay::relay
         if (!s_have_alloc || s_state == State::Stopped || s_peers.empty())
             return false;
         const auto it = s_peers.find(peer_key(peer));
-        return it != s_peers.end() && it->second.via_relay;
+        if (it == s_peers.end())
+            return false;
+        const Peer& p = it->second;
+        if (p.session != Path::Unknown)
+            return p.session == Path::Relay;
+        if (p.last_direct != 0 && now_ms() - p.last_direct < kDirectFreshMs)
+            return false;
+        return p.last_relay != 0;
+    }
+
+    auto queue_relayed_probe_copy(const sockaddr_in& peer, const std::uint8_t* payload, std::size_t len) -> void
+    {
+        if (len == 0 || len + proto::kDataOverhead > proto::kMaxDatagram)
+            return;
+        std::lock_guard lock(s_mu);
+        if (!s_have_alloc || s_state == State::Stopped || s_peers.empty() || s_delayed.size() >= kMaxDelayed)
+            return;
+        const auto it = s_peers.find(peer_key(peer));
+        if (it == s_peers.end() || it->second.last_relay == 0)
+            return;
+
+        Delayed d;
+        d.due = now_ms() + s_probe_delay_ms;
+        d.datagram.resize(proto::kDataOverhead + len);
+        proto::encode_send_header(d.datagram.data(), ntohl(peer.sin_addr.s_addr), ntohs(peer.sin_port));
+        std::memcpy(d.datagram.data() + proto::kDataOverhead, payload, len);
+        s_delayed.push_back(std::move(d));
+        s_cv.notify_all();
+        if (logger::verbose())
+            logger::debug(std::format("relay: probe copy to {} via relay in {} ms", addr_str(peer), s_probe_delay_ms));
     }
 
     auto note_relay_send(const sockaddr_in& peer, std::size_t payload_len) -> void

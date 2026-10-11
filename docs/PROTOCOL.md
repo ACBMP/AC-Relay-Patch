@@ -69,7 +69,14 @@ payload is 1488. The relay drops a RECV that would exceed this and counts it.
   with lease 0 (rate-limited) so the owner re-allocates.
 - Allocation ports accept datagrams from any source (open relay for inbound).
   Every datagram becomes a RECV to the owner.
-- Owner-side routing rule (patch): remember, per peer ip:port, the path of the
-  last datagram received from it (relay RECV vs direct). Send to that peer
-  via the same path (relay = wrap in SEND). Unknown peers go direct.
+- Owner-side routing rule (patch), per peer ip:port:
+  - NAT probes (PRUDP stream type 5) are not routed. They always go direct.
+    If the peer has ever reached us through the relay, a copy also goes
+    through the relay `RelayProbeDelayMs` later (default 80). The game dials
+    the URL whose probe answered first, so a working direct path wins.
+  - Connection traffic goes on the path that the peer's connection traffic
+    last arrived on (relay RECV vs direct). Before there is any, it goes
+    direct if the peer was heard directly in the last 15 s, else through the
+    relay if it ever came that way. Probes never change this path.
+  - Unknown peers go direct.
 - IPv4 only (the game is IPv4-only).

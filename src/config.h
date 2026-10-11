@@ -19,6 +19,11 @@ namespace ac_relay::config
 
         // log every relayed / control packet
         bool verbose = false;
+
+        // NAT probe replies also go through the relay, but this much later
+        // than the direct copy, so a working direct path always wins the
+        // game's "first probe answer" race. 0 = no handicap.
+        int relay_probe_delay_ms = 80;
     };
 
     struct settings

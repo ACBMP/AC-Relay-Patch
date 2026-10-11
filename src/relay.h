@@ -34,12 +34,23 @@ namespace ac_relay::relay
     auto handle_control(const std::uint8_t* data, std::size_t len) -> void;
 
     // Path bookkeeping. peer = network-order sockaddr_in of the remote peer.
-    auto note_relay_recv(const sockaddr_in& peer, std::size_t payload_len) -> void;
-    auto note_direct_recv(const sockaddr_in& peer) -> void;
-    // True if the last datagram from peer came via the relay and we have an
-    // allocation to send through.
+    // session = the datagram is connection traffic, not a NAT probe; only
+    // connection traffic decides a peer's path (probes arrive both ways while
+    // the game races its URLs, and must not flip an established connection).
+    auto note_relay_recv(const sockaddr_in& peer, std::size_t payload_len, bool session) -> void;
+    auto note_direct_recv(const sockaddr_in& peer, bool session) -> void;
+    // Whether connection traffic to peer goes through the relay: the path its
+    // connection traffic last came on; before there is any, direct if we've
+    // heard from the peer directly in the last 15 s, else relay if it ever
+    // reached us through the relay.
     [[nodiscard]] auto should_relay(const sockaddr_in& peer) -> bool;
     auto note_relay_send(const sockaddr_in& peer, std::size_t payload_len) -> void;
+
+    // A NAT probe datagram the game sends directly to peer: if peer ever
+    // reached us through the relay, also send a copy through the relay
+    // RelayProbeDelayMs later, so both of the peer's URLs for us get an answer
+    // and the direct one, when it works, answers first.
+    auto queue_relayed_probe_copy(const sockaddr_in& peer, const std::uint8_t* payload, std::size_t len) -> void;
 
     // Current allocation (host-order ip/port). If none exists yet and an
     // ALLOCATE is in flight, waits up to timeout_ms for ALLOCATED.

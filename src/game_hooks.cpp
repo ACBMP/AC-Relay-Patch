@@ -330,6 +330,14 @@ namespace ac_relay::game_hooks
                 relay::set_game_socket(sock, port);
         }
 
+        // PRUDP v0 header: byte 0/1 = source/destination VPort, (stream type
+        // << 4) | port. Stream type 5 is the NAT traversal probe stream
+        // (URLProbe); connection traffic is stream 1 (DO).
+        [[nodiscard]] bool is_nat_probe(const std::uint8_t* data, std::size_t len)
+        {
+            return len >= 2 && (data[0] >> 4) == 5 && (data[1] >> 4) == 5;
+        }
+
         // ---- send path ---------------------------------------------------------
         // The send is overlapped: the buffer and destination must stay valid
         // until the game sees the op complete. Each socket has exactly one send
@@ -364,8 +372,13 @@ namespace ac_relay::game_hooks
                 const SOCKET sock = *reinterpret_cast<const SOCKET*>(self + kSockHandle);
                 const auto& dest = *reinterpret_cast<const sockaddr_in*>(to);
 
-                if (sock == relay::game_socket() && !relay::is_relay_address(dest) && relay::should_relay(dest) &&
-                    len + proto::kDataOverhead <= sizeof(WrapBuffer::data))
+                // NAT probes always go direct (the original send below); a
+                // delayed copy also goes through the relay. See
+                // relay::queue_relayed_probe_copy.
+                if (sock == relay::game_socket() && !relay::is_relay_address(dest) && is_nat_probe(buf, len))
+                    relay::queue_relayed_probe_copy(dest, buf, len);
+                else if (sock == relay::game_socket() && !relay::is_relay_address(dest) && relay::should_relay(dest) &&
+                         len + proto::kDataOverhead <= sizeof(WrapBuffer::data))
                 {
                     WrapBuffer* w = wrap_buffer_for(op);
                     proto::encode_send_header(w->data, ntohl(dest.sin_addr.s_addr), ntohs(dest.sin_port));
@@ -426,7 +439,7 @@ namespace ac_relay::game_hooks
                         from.sin_family = AF_INET;
                         from.sin_addr.s_addr = htonl(peer_ip);
                         from.sin_port = htons(peer_port);
-                        relay::note_relay_recv(from, payload);
+                        relay::note_relay_recv(from, payload, !is_nat_probe(data, payload));
                         return buffer; // game sees a datagram from peer_ip:peer_port
                     }
                 }
@@ -440,7 +453,7 @@ namespace ac_relay::game_hooks
                 return nullptr;
             }
 
-            relay::note_direct_recv(from);
+            relay::note_direct_recv(from, !is_nat_probe(data, size));
             return buffer;
         }
 

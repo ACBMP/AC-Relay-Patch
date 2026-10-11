@@ -4,6 +4,7 @@
 #define INIPP_IMPLEMENTATION
 #include <inipp/inipp.h>
 
+#include <algorithm>
 #include <format>
 #include <fstream>
 
@@ -50,6 +51,16 @@ namespace ac_relay::config
             inipp::get_value(sec, "Password", s_settings.relay.password);
             if (std::string v; inipp::get_value(sec, "Verbose", v))
                 s_settings.relay.verbose = parse_bool(v);
+            if (std::string v; inipp::get_value(sec, "RelayProbeDelayMs", v))
+            {
+                try
+                {
+                    s_settings.relay.relay_probe_delay_ms = std::clamp(std::stoi(v), 0, 1000);
+                }
+                catch (const std::exception&)
+                {
+                }
+            }
 
             return true;
         }
@@ -80,6 +91,8 @@ namespace ac_relay::config
             file << std::format("Password={}\n", s_settings.relay.password);
             file << "; log every relayed/control packet to ac_relay.log\n";
             file << std::format("Verbose={}\n", s_settings.relay.verbose ? "true" : "false");
+            file << "; extra delay (ms) on relayed NAT probe replies so direct connections win; 0 = none\n";
+            file << std::format("RelayProbeDelayMs={}\n", s_settings.relay.relay_probe_delay_ms);
             return true;
         }
         catch (const std::exception& e)
