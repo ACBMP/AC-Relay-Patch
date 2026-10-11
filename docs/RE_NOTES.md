@@ -238,3 +238,20 @@ flag is 0.
   ALLOCATED, have a slot. It uses a free slot first, then one holding a
   172.16/12 or 169.254/16 address, then the last slot. It never uses slot 0
   (the game's public URL). The RVCID is copied from the game's own slots.
+
+## ASLR: Wine vs Windows
+
+- ACBMP.exe has DYNAMIC_BASE and a full .reloc table. Wine loads it at
+  0x00400000. Windows (ASLR) usually loads it elsewhere, and the loader then
+  rewrites every absolute address in the code.
+- All hook addresses are already base-relative (GetModuleHandle + RVA). But
+  byte signatures that contain an absolute address fail on Windows. The first
+  Windows tester's log showed "Network::AddLocalURL ... signature mismatch",
+  so no URL was ever published, while the socket hooks (no absolute
+  addresses) matched.
+- `check_sig` takes the offsets of absolute addresses and compares them
+  relocated by (actual base - 0x00400000). The offsets were checked against
+  the .reloc table: AddLocalURL +5, PrepareURLs +3, ObjDup::AddLocalURLs
+  +3/+11, ConnectionInfo::SetURL +12. The StationURL dtor's byte 15 is the
+  low byte of a relocated address, which is invariant in 64 KiB steps.
+- The station-slot fix (ObjDup hook + SetURL) no longer depends on AddLocalURL.

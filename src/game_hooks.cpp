@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -99,6 +100,8 @@ namespace ac_relay::game_hooks
             0x56, 0x8b, 0xf1, 0x8d, 0x44, 0x24, 0x08, 0x50, 0x8d, 0x4c, 0x24, 0x0c, 0x51, 0x8d, 0x4e, 0x08};
 
         // Quazal::StationURL::~StationURL()  __thiscall
+        // (byte 15 is the low byte of a relocated address; image relocations
+        // move in 64 KiB steps, so it never changes)
         constexpr std::uintptr_t kStationUrlDtorRva = 0x01d0ae60 - kImageBase;
         constexpr std::array<std::uint8_t, 16> kStationUrlDtorSig{
             0x56, 0x57, 0x8b, 0xf9, 0x8b, 0x47, 0x74, 0x85, 0xc0, 0x74, 0x67, 0x8d, 0x70, 0xfc, 0xa1, 0x00};
@@ -155,14 +158,37 @@ namespace ac_relay::game_hooks
         std::atomic<std::uint16_t> s_main_port{0};   // port StartListen stamped on the local URLs
 
         // ---- signature helper ------------------------------------------------
+        // ACBMP.exe has DYNAMIC_BASE and a .reloc table: Wine loads it at its
+        // preferred 0x00400000, Windows (ASLR) usually elsewhere, and the loader
+        // then rewrites every absolute address in the code. `abs_offsets` lists
+        // where a signature holds such an address (written for base
+        // 0x00400000); those 4 bytes are compared relocated to the actual base.
         template <std::size_t N>
-        [[nodiscard]] bool check_sig(std::uintptr_t rva, const std::array<std::uint8_t, N>& sig, const char* what)
+        [[nodiscard]] bool check_sig(std::uintptr_t rva, const std::array<std::uint8_t, N>& sig, const char* what,
+                                     std::initializer_list<std::size_t> abs_offsets = {})
         {
-            const auto* p = reinterpret_cast<const std::uint8_t*>(s_base + rva);
-            if (std::memcmp(p, sig.data(), N) != 0)
+            std::array<std::uint8_t, N> expected = sig;
+            const auto delta = static_cast<std::uint32_t>(s_base - kImageBase);
+            for (const std::size_t off : abs_offsets)
             {
-                logger::warn(std::format("{} (VA {:#010x}) byte signature mismatch -- different game build?", what,
-                                         rva + kImageBase));
+                std::uint32_t v = 0;
+                std::memcpy(&v, expected.data() + off, 4);
+                v += delta;
+                std::memcpy(expected.data() + off, &v, 4);
+            }
+
+            const auto* p = reinterpret_cast<const std::uint8_t*>(s_base + rva);
+            if (std::memcmp(p, expected.data(), N) != 0)
+            {
+                std::string found, wanted;
+                for (std::size_t i = 0; i < N; ++i)
+                {
+                    found += std::format("{:02x} ", p[i]);
+                    wanted += std::format("{:02x} ", expected[i]);
+                }
+                logger::warn(std::format("{} (VA {:#010x}, at {:#010x}) byte signature mismatch -- different game "
+                                         "build or hooked by another mod? found [{}] expected [{}]",
+                                         what, rva + kImageBase, s_base + rva, found, wanted));
                 return false;
             }
             return true;
@@ -722,6 +748,9 @@ namespace ac_relay::game_hooks
             return false;
         }
 
+        logger::info(std::format("ACBMP.exe loaded at {:#010x}{}", s_base,
+                                 s_base == kImageBase ? " (preferred base)" : " (relocated by ASLR)"));
+
         // ---- data path: both or nothing --------------------------------------
         const bool send_ok = check_sig(kSendToRva, kSendToSig, "BerkeleySocket::SendTo");
         const bool recv_ok = check_sig(kCompleteBufferRecvRva, kCompleteBufferRecvSig, "QueuingSocket::CompleteBufferRecv");
@@ -748,8 +777,9 @@ namespace ac_relay::game_hooks
         // ---- URL publication ---------------------------------------------------
         const bool ctor_ok = check_sig(kStationUrlCtorRva, kStationUrlCtorSig, "StationURL::StationURL(const char*)");
         const bool dtor_ok = check_sig(kStationUrlDtorRva, kStationUrlDtorSig, "StationURL::~StationURL");
-        const bool add_ok = check_sig(kAddLocalUrlRva, kAddLocalUrlSig, "Network::AddLocalURL");
+        const bool add_ok = check_sig(kAddLocalUrlRva, kAddLocalUrlSig, "Network::AddLocalURL", {5});
 
+        int publish_points = 0;
         if (ctor_ok && dtor_ok && add_ok)
         {
             s_url_ctor = reinterpret_cast<StationUrlCtorFn>(s_base + kStationUrlCtorRva);
@@ -766,35 +796,39 @@ namespace ac_relay::game_hooks
                 s_add_local_url_original = reinterpret_cast<AddLocalUrlFn>(s_base + kAddLocalUrlRva);
             }
 
-            int publish_points = 0;
-            if (check_sig(kPrepareUrlsRva, kPrepareUrlsSig, "SecureConnectionClient::PrepareURLs"))
+            // login registration (RegisterEx): needs AddLocalURL to add our URLs
+            if (check_sig(kPrepareUrlsRva, kPrepareUrlsSig, "SecureConnectionClient::PrepareURLs", {3}))
             {
                 s_prepare_urls_hook =
                     safetyhook::create_mid(reinterpret_cast<void*>(s_base + kPrepareUrlsRva), mid_prepare_urls);
                 publish_points += s_prepare_urls_hook ? 1 : 0;
             }
-            if (check_sig(kConnInfoSetUrlRva, kConnInfoSetUrlSig, "ConnectionInfo::SetURL"))
-                s_conninfo_set_url = reinterpret_cast<ConnInfoSetUrlFn>(s_base + kConnInfoSetUrlRva);
-            else
-                logger::warn("relay URL may be dropped on PCs with more than 4 network interfaces");
-            if (check_sig(kObjDupAddLocalUrlsRva, kObjDupAddLocalUrlsSig, "ObjDupProtocol::AddLocalURLs"))
-            {
-                s_objdup_add_local_urls_hook =
-                    safetyhook::create_inline(reinterpret_cast<void*>(s_base + kObjDupAddLocalUrlsRva),
-                                              reinterpret_cast<void*>(&hk_objdup_add_local_urls));
-                publish_points += s_objdup_add_local_urls_hook ? 1 : 0;
-            }
-
-            if (publish_points == 0)
-                logger::error("no URL publication hook installed: peers will never learn the relay address");
-            else
-                logger::info(std::format("relay URL publication hooks installed: {}/2", publish_points));
         }
         else
         {
-            logger::error("StationURL/AddLocalURL signatures mismatch: relay URL can't be published, "
-                          "relay will only carry traffic for peers that already know the address");
+            logger::warn("StationURL/AddLocalURL unavailable: the relay URL is not registered at login; "
+                         "station/session URLs are still fixed up below");
         }
+
+        // station + session URLs (what peers dial): independent of AddLocalURL,
+        // the relay/public URLs are written straight into the station's slots
+        if (check_sig(kConnInfoSetUrlRva, kConnInfoSetUrlSig, "ConnectionInfo::SetURL", {12}))
+            s_conninfo_set_url = reinterpret_cast<ConnInfoSetUrlFn>(s_base + kConnInfoSetUrlRva);
+        else
+            logger::warn("ConnectionInfo::SetURL unavailable: relay URL is dropped on PCs with more than 4 "
+                         "network interfaces, and not published at all without AddLocalURL");
+        if (check_sig(kObjDupAddLocalUrlsRva, kObjDupAddLocalUrlsSig, "ObjDupProtocol::AddLocalURLs", {3, 11}))
+        {
+            s_objdup_add_local_urls_hook =
+                safetyhook::create_inline(reinterpret_cast<void*>(s_base + kObjDupAddLocalUrlsRva),
+                                          reinterpret_cast<void*>(&hk_objdup_add_local_urls));
+            publish_points += s_objdup_add_local_urls_hook ? 1 : 0;
+        }
+
+        if (publish_points == 0)
+            logger::error("no URL publication hook installed: peers will never learn the relay address");
+        else
+            logger::info(std::format("relay URL publication hooks installed: {}/2", publish_points));
 
         s_active = true;
         return true;
