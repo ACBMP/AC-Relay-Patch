@@ -17,7 +17,10 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 // =============================================================================
 // ACBMP.exe (Windows build, image base 0x00400000, no ASLR). Every constant
@@ -73,12 +76,22 @@ namespace ac_relay::game_hooks
         constexpr std::array<std::uint8_t, 16> kPrepareUrlsSig{
             0x51, 0x80, 0x3d, 0x4c, 0x96, 0x68, 0x02, 0x00, 0x53, 0x55, 0x56, 0x57, 0x8b, 0xf1, 0x74, 0x10};
 
-        // Quazal::ObjDupProtocol::AddLocalURLs(Station*)
+        // Quazal::ObjDupProtocol::AddLocalURLs(Station*)  __thiscall, RET 4
         // (stamps RVCID on every Network local URL and copies them into the
         // local Station's ConnectionInfo = what peers dial)
         constexpr std::uintptr_t kObjDupAddLocalUrlsRva = 0x01ab5d50 - kImageBase;
         constexpr std::array<std::uint8_t, 16> kObjDupAddLocalUrlsSig{
             0x51, 0x80, 0x3d, 0x4c, 0x96, 0x68, 0x02, 0x00, 0x74, 0x10, 0xb9, 0xd0, 0xae, 0x68, 0x02, 0xe8};
+
+        // Quazal::ConnectionInfo::SetURL(int slot, const char* url)  __thiscall, RET 8
+        // ConnectionInfo holds only 5 URL slots (Quazal::String at +8..+0x18).
+        // ConnectionInfo::AddURL (0x01a87ef0) silently drops a 6th URL, so on
+        // a PC with many interfaces (VPNs, Docker bridges, Hyper-V) the relay
+        // URL, added last, never reached the station URLs peers dial or the
+        // session URLs (createSession/migrateSession read the same slots).
+        constexpr std::uintptr_t kConnInfoSetUrlRva = 0x01a87e20 - kImageBase;
+        constexpr std::array<std::uint8_t, 16> kConnInfoSetUrlSig{
+            0x8b, 0x44, 0x24, 0x04, 0x83, 0xf8, 0x04, 0x77, 0x54, 0xff, 0x24, 0x85, 0x80, 0x7e, 0xa8, 0x01};
 
         // Quazal::StationURL::StationURL(const char*)  __thiscall, RET 4
         constexpr std::uintptr_t kStationUrlCtorRva = 0x01d0acc0 - kImageBase;
@@ -108,6 +121,11 @@ namespace ac_relay::game_hooks
         constexpr std::size_t kBufCapacity = 0x10; // allocated size
         constexpr std::size_t kBufReleaseVtblSlot = 2; // vtable+8, __thiscall()
 
+        // Quazal::Station / ConnectionInfo layout (Windows; Mac has it at +0x70)
+        constexpr std::size_t kStationConnInfo = 0x84;
+        constexpr std::size_t kConnInfoUrls = 0x08; // 5 x Quazal::String, char* at +0
+        constexpr int kConnInfoSlots = 5;
+
         // Quazal::StationURL layout
         constexpr std::size_t kStationUrlSize = 0x7c;     // list node alloc 0x84 = 8 + 0x7c
         constexpr std::size_t kUrlInetPtr = 0x00;         // InetAddress* (sockaddr_in at +0)
@@ -116,6 +134,7 @@ namespace ac_relay::game_hooks
         using StationUrlCtorFn = void*(__thiscall*)(void* self, const char* url);
         using StationUrlDtorFn = void(__thiscall*)(void* self);
         using AddLocalUrlFn = void(__thiscall*)(void* network, const void* url);
+        using ConnInfoSetUrlFn = void(__thiscall*)(void* conninfo, int slot, const char* url);
         using BufferReleaseFn = void(__thiscall*)(void* buffer);
 
         std::uintptr_t s_base = 0;
@@ -125,11 +144,12 @@ namespace ac_relay::game_hooks
         SafetyHookInline s_recv_hook{};
         SafetyHookInline s_add_local_url_hook{};
         SafetyHookMid s_prepare_urls_hook{};
-        SafetyHookMid s_objdup_add_local_urls_hook{};
+        SafetyHookInline s_objdup_add_local_urls_hook{};
 
         StationUrlCtorFn s_url_ctor = nullptr;
         StationUrlDtorFn s_url_dtor = nullptr;
         AddLocalUrlFn s_add_local_url_original = nullptr; // trampoline (or the raw fn if not hooked)
+        ConnInfoSetUrlFn s_conninfo_set_url = nullptr;
 
         std::atomic<void*> s_network{nullptr};       // captured from AddLocalURL's this
         std::atomic<std::uint16_t> s_main_port{0};   // port StartListen stamped on the local URLs
@@ -204,6 +224,47 @@ namespace ac_relay::game_hooks
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
                 // leak the half-built URL rather than risk a second fault
+                return 1;
+            }
+        }
+
+        using SlotText = char[256];
+
+        // Copies the 5 ConnectionInfo URL strings of `station` (empty = unused).
+        // Returns 0 on success, 1 on fault.
+        int read_station_slots_seh(const std::uint8_t* station, SlotText* out)
+        {
+            __try
+            {
+                const std::uint8_t* ci = station + kStationConnInfo;
+                for (int i = 0; i < kConnInfoSlots; ++i)
+                {
+                    out[i][0] = '\0';
+                    const char* p = *reinterpret_cast<const char* const*>(ci + kConnInfoUrls + 4 * i);
+                    if (!p)
+                        continue;
+                    int n = 0;
+                    for (; n < static_cast<int>(sizeof(SlotText)) - 1 && p[n]; ++n)
+                        out[i][n] = p[n];
+                    out[i][n] = '\0';
+                }
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return 1;
+            }
+        }
+
+        int set_station_slot_seh(ConnInfoSetUrlFn set_url, std::uint8_t* station, int slot, const char* url)
+        {
+            __try
+            {
+                set_url(station + kStationConnInfo, slot, url);
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
                 return 1;
             }
         }
@@ -407,6 +468,44 @@ namespace ac_relay::game_hooks
         std::mutex s_url_mu;
         std::uint32_t s_published_ip = 0;
         std::uint16_t s_published_port = 0;
+        std::uint32_t s_published_observed_ip = 0;
+        std::uint16_t s_published_observed_port = 0;
+
+        [[nodiscard]] std::string ip_text(std::uint32_t ip)
+        {
+            return std::format("{}.{}.{}.{}", (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
+        }
+
+        // Value of `key` in a StationURL string ("prudp:/address=..;port=..;RVCID=.."), or empty.
+        [[nodiscard]] std::string_view url_param(std::string_view url, std::string_view key)
+        {
+            const auto body = url.find(":/");
+            if (body == std::string_view::npos)
+                return {};
+            url.remove_prefix(body + 2);
+            while (!url.empty())
+            {
+                const auto end = url.find(';');
+                const std::string_view item = url.substr(0, end);
+                const auto eq = item.find('=');
+                if (eq != std::string_view::npos && item.substr(0, eq) == key)
+                    return item.substr(eq + 1);
+                if (end == std::string_view::npos)
+                    break;
+                url.remove_prefix(end + 1);
+            }
+            return {};
+        }
+
+        // Docker/WSL/Hyper-V bridges (172.16/12) and link-local (169.254/16):
+        // the first candidates to give up a slot for the relay.
+        [[nodiscard]] bool is_throwaway_address(std::string_view address)
+        {
+            unsigned a = 0, b = 0;
+            if (std::sscanf(std::string(address).c_str(), "%u.%u", &a, &b) != 2)
+                return false;
+            return (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
+        }
 
         void publish_relay_url(const char* stage)
         {
@@ -443,6 +542,27 @@ namespace ac_relay::game_hooks
                 return;
             }
 
+            // Our public address as the relay saw it. Players reaching the
+            // lobby over a VPN otherwise never learn each other's real
+            // address, so direct hole punching can't even be tried.
+            std::uint32_t oip = 0;
+            std::uint16_t oport = 0;
+            if (relay::observed_address(oip, oport))
+            {
+                char observed[96];
+                std::snprintf(observed, sizeof(observed), "prudp:/address=%u.%u.%u.%u;port=%u", (oip >> 24) & 0xff,
+                              (oip >> 16) & 0xff, (oip >> 8) & 0xff, oip & 0xff, static_cast<unsigned>(oport));
+                if (add_local_url_seh(s_url_ctor, s_url_dtor, s_add_local_url_original, network, observed) != 0)
+                    logger::error(std::format("{}: fault while adding public URL '{}'", stage, observed));
+                else if (oip != s_published_observed_ip || oport != s_published_observed_port)
+                {
+                    s_published_observed_ip = oip;
+                    s_published_observed_port = oport;
+                    logger::info(std::format("{}: published public URL '{}' (our address as the relay sees it)",
+                                             stage, observed));
+                }
+            }
+
             if (ip != s_published_ip || port != s_published_port)
             {
                 if (s_published_port != 0)
@@ -463,9 +583,120 @@ namespace ac_relay::game_hooks
             publish_relay_url("RegisterURLs (SecureConnectionClient::PrepareURLs)");
         }
 
-        void mid_objdup_add_local_urls(safetyhook::Context& /*ctx*/)
+        // Makes sure the relay URL (and the public address the relay sees)
+        // occupy a station URL slot: a free one, else one holding a
+        // throwaway address, else the last. Slot 0 is never touched: the
+        // game puts its public URL there.
+        void ensure_station_urls(std::uint8_t* station)
+        {
+            if (!s_conninfo_set_url || !station)
+                return;
+
+            std::uint32_t ip = 0;
+            std::uint16_t port = 0;
+            if (!relay::wait_allocation(0, ip, port))
+                return;
+
+            struct Wanted
+            {
+                std::string address;
+                std::uint16_t port;
+                const char* what;
+            };
+            std::vector<Wanted> wanted{{ip_text(ip), port, "relay"}};
+            std::uint32_t oip = 0;
+            std::uint16_t oport = 0;
+            if (relay::observed_address(oip, oport))
+                wanted.push_back({ip_text(oip), oport, "public"});
+
+            SlotText raw[kConnInfoSlots];
+            if (read_station_slots_seh(station, raw) != 0)
+            {
+                logger::warn("station URLs: fault reading the station's URL slots; relay URL may be missing");
+                return;
+            }
+            std::array<std::string, kConnInfoSlots> slots;
+            for (int i = 0; i < kConnInfoSlots; ++i)
+                slots[i] = raw[i];
+
+            // AddLocalURLs returns early (no URLs at all) for stations it
+            // doesn't publish; leave those alone.
+            if (slots[0].empty())
+                return;
+
+            std::string rvcid;
+            for (const auto& u : slots)
+                if (const auto v = url_param(u, "RVCID"); !v.empty())
+                {
+                    rvcid = v;
+                    break;
+                }
+
+            const auto holds = [&](int i, const Wanted& w) {
+                return url_param(slots[i], "address") == w.address &&
+                       url_param(slots[i], "port") == std::to_string(w.port);
+            };
+
+            std::array<bool, kConnInfoSlots> keep{};
+            keep[0] = true;
+            for (int i = 0; i < kConnInfoSlots; ++i)
+                for (const auto& w : wanted)
+                    if (holds(i, w))
+                        keep[i] = true;
+
+            for (const auto& w : wanted)
+            {
+                bool present = false;
+                for (int i = 0; i < kConnInfoSlots && !present; ++i)
+                    present = holds(i, w);
+                if (present)
+                    continue;
+
+                // slots are read up to the first empty one: use that if any
+                int target = -1;
+                for (int i = 0; i < kConnInfoSlots && target < 0; ++i)
+                    if (slots[i].empty())
+                        target = i;
+                for (int i = kConnInfoSlots - 1; i > 0 && target < 0; --i)
+                    if (!keep[i] && is_throwaway_address(url_param(slots[i], "address")))
+                        target = i;
+                for (int i = kConnInfoSlots - 1; i > 0 && target < 0; --i)
+                    if (!keep[i])
+                        target = i;
+                if (target < 0)
+                {
+                    logger::warn(std::format("station URLs: no slot left for the {} URL {}:{}", w.what, w.address,
+                                             w.port));
+                    continue;
+                }
+
+                std::string url = std::format("prudp:/address={};port={}", w.address, w.port);
+                if (!rvcid.empty())
+                    url += std::format(";RVCID={}", rvcid);
+                if (set_station_slot_seh(s_conninfo_set_url, station, target, url.c_str()) != 0)
+                {
+                    logger::error(std::format("station URLs: fault writing slot {}", target));
+                    return;
+                }
+                logger::info(std::format("station URLs: slot {} {} -> '{}' ({} URL)", target,
+                                         slots[target].empty() ? std::string("(empty)")
+                                                               : std::format("'{}'", slots[target]),
+                                         url, w.what));
+                slots[target] = url;
+                keep[target] = true;
+            }
+
+            if (logger::verbose())
+                for (int i = 0; i < kConnInfoSlots; ++i)
+                    logger::debug(std::format("station URL slot {}: '{}'", i, slots[i]));
+        }
+
+        int __fastcall hk_objdup_add_local_urls(void* self, void* /*edx*/, std::uint8_t* station)
         {
             publish_relay_url("station URLs (ObjDupProtocol::AddLocalURLs)");
+            const int result = s_objdup_add_local_urls_hook.unsafe_thiscall<int>(self, station);
+            ensure_station_urls(station);
+            return result;
         }
     }
 
@@ -529,10 +760,15 @@ namespace ac_relay::game_hooks
                     safetyhook::create_mid(reinterpret_cast<void*>(s_base + kPrepareUrlsRva), mid_prepare_urls);
                 publish_points += s_prepare_urls_hook ? 1 : 0;
             }
+            if (check_sig(kConnInfoSetUrlRva, kConnInfoSetUrlSig, "ConnectionInfo::SetURL"))
+                s_conninfo_set_url = reinterpret_cast<ConnInfoSetUrlFn>(s_base + kConnInfoSetUrlRva);
+            else
+                logger::warn("relay URL may be dropped on PCs with more than 4 network interfaces");
             if (check_sig(kObjDupAddLocalUrlsRva, kObjDupAddLocalUrlsSig, "ObjDupProtocol::AddLocalURLs"))
             {
-                s_objdup_add_local_urls_hook = safetyhook::create_mid(
-                    reinterpret_cast<void*>(s_base + kObjDupAddLocalUrlsRva), mid_objdup_add_local_urls);
+                s_objdup_add_local_urls_hook =
+                    safetyhook::create_inline(reinterpret_cast<void*>(s_base + kObjDupAddLocalUrlsRva),
+                                              reinterpret_cast<void*>(&hk_objdup_add_local_urls));
                 publish_points += s_objdup_add_local_urls_hook ? 1 : 0;
             }
 

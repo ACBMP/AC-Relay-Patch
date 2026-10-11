@@ -84,6 +84,8 @@ namespace ac_relay::relay
         bool s_have_alloc = false;      // relay_ip/alloc_port valid (also while re-allocating)
         std::uint32_t s_relay_ip = 0;   // host order
         std::uint16_t s_alloc_port = 0; // host order
+        std::uint32_t s_observed_ip = 0;   // host order; our address as the relay sees it
+        std::uint16_t s_observed_port = 0; // host order
 
         std::unordered_map<std::uint64_t, Peer> s_peers;
 
@@ -440,6 +442,8 @@ namespace ac_relay::relay
             s_have_alloc = true;
             s_relay_ip = a.relay_ip;
             s_alloc_port = a.alloc_port;
+            s_observed_ip = a.observed_ip;
+            s_observed_port = a.observed_port;
             s_state = State::Allocated;
             s_alloc_attempts = 0;
             s_backoff_ms = kDeniedBackoffBaseMs;
@@ -589,6 +593,16 @@ namespace ac_relay::relay
 
         relay_ip = s_relay_ip;
         alloc_port = s_alloc_port;
+        return true;
+    }
+
+    auto observed_address(std::uint32_t& ip, std::uint16_t& port) -> bool
+    {
+        std::lock_guard lock(s_mu);
+        if (!s_have_alloc || s_observed_ip == 0 || s_observed_port == 0)
+            return false;
+        ip = s_observed_ip;
+        port = s_observed_port;
         return true;
     }
 }

@@ -6,6 +6,8 @@
 
 #include <format>
 #include <memory>
+#include <string>
+#include <system_error>
 
 namespace ac_relay::logger
 {
@@ -18,6 +20,17 @@ namespace ac_relay::logger
     auto initialize(const std::filesystem::path& log_path, bool verbose) -> bool
     {
         s_verbose = verbose;
+
+        // keep the previous runs' logs: ac_relay.log.1 (newest) .. .5
+        {
+            constexpr int kKeep = 5;
+            std::error_code ec;
+            auto numbered = [&](int i) { return std::filesystem::path(log_path.string() + "." + std::to_string(i)); };
+            std::filesystem::remove(numbered(kKeep), ec);
+            for (int i = kKeep - 1; i >= 1; --i)
+                std::filesystem::rename(numbered(i), numbered(i + 1), ec);
+            std::filesystem::rename(log_path, numbered(1), ec);
+        }
 
         try
         {

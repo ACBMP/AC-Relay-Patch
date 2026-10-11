@@ -219,3 +219,22 @@ flag is 0.
 7. Socket selection fallback (when the game listened before the hooks
    went in) assumes the first UDP send is the main socket. In LAN mode a
    discovery socket might come first.
+
+## Station URL slots (5 max)
+
+- `ObjDupProtocol::AddLocalURLs` (VA 0x01ab5d50) copies the Network local URLs
+  into the local Station's `ConnectionInfo` (Station+0x84 on Windows, +0x70 on
+  Mac). It does this with `ConnectionInfo::AddURL` (0x01a87ef0).
+- `ConnectionInfo` has exactly 5 URL slots: Quazal::String at +0x08..+0x18,
+  written by `SetURL(int, const char*)` at 0x01a87e20 (`thiscall`, `RET 8`).
+  `AddURL` silently drops a 6th URL.
+- `createSession` and `migrateSession` read the session URLs from the same
+  slots (`Station::GetStationURLs`), and so does the mesh (`JobConnectStation`).
+- So on a PC with more than 4 interfaces (VPNs, Docker bridges, Hyper-V), the
+  relay URL, which is added last, was never seen by anyone. The first live test
+  (8 interfaces under Wine) showed exactly that.
+- Fix: `AddLocalURLs` is now an inline hook. After the original runs, the
+  patch makes sure the relay URL, and the public address the relay saw in
+  ALLOCATED, have a slot. It uses a free slot first, then one holding a
+  172.16/12 or 169.254/16 address, then the last slot. It never uses slot 0
+  (the game's public URL). The RVCID is copied from the game's own slots.

@@ -45,4 +45,8 @@ namespace ac_relay::relay
     // ALLOCATE is in flight, waits up to timeout_ms for ALLOCATED.
     [[nodiscard]] auto wait_allocation(std::uint32_t timeout_ms, std::uint32_t& relay_ip,
                                        std::uint16_t& alloc_port) -> bool;
+
+    // Our public address as the relay saw it in the last ALLOCATED (host
+    // order). False before the first allocation.
+    [[nodiscard]] auto observed_address(std::uint32_t& ip, std::uint16_t& port) -> bool;
 }
