@@ -17,6 +17,10 @@ namespace ac_relay::relay
     // patch stays a no-op) if Server is unset or can't be resolved.
     [[nodiscard]] auto initialize(const config::relay_settings& settings) -> bool;
     auto shutdown() -> void;
+    // initialize() succeeded (a relay server is configured)
+    [[nodiscard]] auto active() -> bool;
+    // OneAddressPerPeer without a relay (initialize() sets it otherwise)
+    auto set_one_address_per_peer(bool on) -> void;
 
     // The game's PRUDP socket was found (or replaced). Resets the allocation
     // if the socket changed; the worker then sends ALLOCATE from it.

@@ -410,7 +410,7 @@ namespace ac_relay::relay
     {
         if (settings.server.empty())
         {
-            logger::info("relay: Server not set in ac_relay.ini; patch is a no-op");
+            logger::info("relay: Server not set in ac_relay.ini; relay off");
             return false;
         }
 
@@ -418,14 +418,14 @@ namespace ac_relay::relay
         WSADATA wsa{};
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
         {
-            logger::error("relay: WSAStartup failed; patch is a no-op");
+            logger::error("relay: WSAStartup failed; relay off");
             return false;
         }
 
         sockaddr_in server{};
         if (!resolve(settings.server, server))
         {
-            logger::error(std::format("relay: cannot resolve Server '{}' (IPv4 host:port expected); patch is a no-op",
+            logger::error(std::format("relay: cannot resolve Server '{}' (IPv4 host:port expected); relay off",
                                       settings.server));
             return false;
         }
@@ -448,6 +448,18 @@ namespace ac_relay::relay
         return true;
     }
 
+    auto active() -> bool
+    {
+        std::lock_guard lock(s_mu);
+        return s_initialized;
+    }
+
+    auto set_one_address_per_peer(bool on) -> void
+    {
+        std::lock_guard lock(s_mu);
+        s_one_address = on;
+    }
+
     auto shutdown() -> void
     {
         // Called from DLL_PROCESS_DETACH: no joins, no sends (loader lock).
@@ -462,7 +474,7 @@ namespace ac_relay::relay
     auto set_game_socket(SOCKET s, std::uint16_t local_port) -> void
     {
         std::lock_guard lock(s_mu);
-        if (!s_initialized || s == s_sock)
+        if (s == s_sock)
             return;
 
         const bool replacing = s_sock != INVALID_SOCKET;
@@ -473,7 +485,9 @@ namespace ac_relay::relay
         s_local_port = local_port;
         s_peers.clear();
 
-        if (s_state == State::Stopped)
+        // without a relay server the socket is still tracked: the hooks key
+        // the IPv6 path and one-address-per-peer on it
+        if (!s_initialized || s_state == State::Stopped)
             return;
 
         // New socket = new NAT mapping = (probably) a new allocation.

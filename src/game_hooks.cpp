@@ -1,4 +1,5 @@
 #include "game_hooks.h"
+#include "ipv6.h"
 #include "logger.h"
 #include "protocol.h"
 #include "relay.h"
@@ -106,6 +107,14 @@ namespace ac_relay::game_hooks
         constexpr std::array<std::uint8_t, 16> kStationUrlDtorSig{
             0x56, 0x57, 0x8b, 0xf9, 0x8b, 0x47, 0x74, 0x85, 0xc0, 0x74, 0x67, 0x8d, 0x70, 0xfc, 0xa1, 0x00};
 
+        // Quazal::StationURL::Parse()  __fastcall(this)
+        // (lazy parse of the URL string at this+0x74; ParseParam keeps
+        // unknown keys such as v6=, Format writes them back -- docs/IPV6.md)
+        constexpr std::uintptr_t kStationUrlParseRva = 0x01d082f0 - kImageBase;
+        constexpr std::array<std::uint8_t, 16> kStationUrlParseSig{
+            0x51, 0x56, 0x8b, 0xf1, 0x8b, 0x06, 0xc6, 0x46, 0x78, 0x01, 0x33, 0xc9, 0x89, 0x08, 0x89, 0x48};
+        constexpr std::size_t kUrlString = 0x74; // char*
+
         // Network::GetInstance() is inlined everywhere as:
         //   if (!g_multiContext) net = g_networkHolder ? g_networkHolder->[+0xc] : 0
         constexpr std::uintptr_t kMultiContextFlagRva = 0x0268964c - kImageBase; // u8
@@ -148,6 +157,7 @@ namespace ac_relay::game_hooks
         SafetyHookInline s_add_local_url_hook{};
         SafetyHookMid s_prepare_urls_hook{};
         SafetyHookInline s_objdup_add_local_urls_hook{};
+        SafetyHookMid s_url_parse_hook{};
 
         StationUrlCtorFn s_url_ctor = nullptr;
         StationUrlDtorFn s_url_dtor = nullptr;
@@ -254,6 +264,27 @@ namespace ac_relay::game_hooks
             }
         }
 
+        // Copies the URL string a StationURL is about to parse. Returns 0 on
+        // success, 1 if there is none or on fault.
+        int read_url_string_seh(const std::uint8_t* url, char* out, int cap)
+        {
+            __try
+            {
+                const char* p = *reinterpret_cast<const char* const*>(url + kUrlString);
+                if (!p)
+                    return 1;
+                int n = 0;
+                for (; n < cap - 1 && p[n]; ++n)
+                    out[n] = p[n];
+                out[n] = '\0';
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return 1;
+            }
+        }
+
         using SlotText = char[256];
 
         // Copies the 5 ConnectionInfo URL strings of `station` (empty = unused).
@@ -353,7 +384,10 @@ namespace ac_relay::game_hooks
                                                           : "assumed main PRUDP socket (published port unknown)")
                                              : "not the main socket, ignored"));
             if (is_main)
+            {
                 relay::set_game_socket(sock, port);
+                ipv6::set_game_socket(sock);
+            }
         }
 
         // PRUDP v0 header: byte 0/1 = source/destination VPort, (stream type
@@ -411,6 +445,23 @@ namespace ac_relay::game_hooks
             return slot.get();
         }
 
+        // Where a send the hooks must drop goes instead: the relay's control
+        // port, else the IPv6 gateway. False if neither exists.
+        [[nodiscard]] bool sink_address(sockaddr_in& out)
+        {
+            if (relay::active())
+            {
+                out = relay::server_address();
+                return true;
+            }
+            if (ipv6::active())
+            {
+                out = ipv6::gateway_address();
+                return true;
+            }
+            return false;
+        }
+
         int __fastcall hk_send_to(std::uint8_t* self, void* /*edx*/, const std::uint8_t* buf, std::uint32_t len,
                                   const std::uint8_t* to, void* op)
         {
@@ -422,20 +473,38 @@ namespace ac_relay::game_hooks
                 const auto& dest = *reinterpret_cast<const sockaddr_in*>(to);
 
                 bool wrap = false;
-                if (sock == relay::game_socket() && !relay::is_relay_address(dest))
+                if (sock == relay::game_socket() && !relay::is_relay_address(dest) &&
+                    !ipv6::is_gateway_address(dest))
                 {
-                    if (relay::is_second_address(dest, "to"))
+                    sockaddr_in sink{};
+                    if (relay::is_second_address(dest, "to") && sink_address(sink))
                     {
                         // Can't just skip an overlapped send (the game waits
                         // for it to complete): send it to the relay's control
-                        // port instead, which drops anything without its magic.
+                        // port or the IPv6 gateway instead, which drop
+                        // anything without their magic.
                         WrapBuffer* w = wrap_buffer_for(op);
                         std::memset(w->to, 0, sizeof(w->to));
-                        const sockaddr_in relay_addr = relay::server_address();
-                        std::memcpy(w->to, &relay_addr, sizeof(sockaddr_in));
+                        std::memcpy(w->to, &sink, sizeof(sockaddr_in));
                         return s_send_to_hook.unsafe_thiscall<int>(self, buf, len, w->to, op);
                     }
-                    if (is_nat_probe(buf, len))
+                    if (ipv6::active() && ipv6::is_virtual(dest))
+                    {
+                        // An IPv6 peer: framed to the gateway, which sends it
+                        // over IPv6 (or drops it if the address is unknown).
+                        if (len + ipv6::kFrameOverhead <= sizeof(WrapBuffer::data))
+                        {
+                            WrapBuffer* w = wrap_buffer_for(op);
+                            ipv6::encode_to_peer(w->data, dest);
+                            std::memcpy(w->data + ipv6::kFrameOverhead, buf, len);
+                            std::memset(w->to, 0, sizeof(w->to));
+                            const sockaddr_in gw = ipv6::gateway_address();
+                            std::memcpy(w->to, &gw, sizeof(sockaddr_in));
+                            return s_send_to_hook.unsafe_thiscall<int>(
+                                self, w->data, static_cast<std::uint32_t>(len + ipv6::kFrameOverhead), w->to, op);
+                        }
+                    }
+                    else if (is_nat_probe(buf, len))
                     {
                         // Probe replies go back the way their request came
                         // (relay::route_probe_reply). Our own requests go
@@ -495,7 +564,22 @@ namespace ac_relay::game_hooks
             if (!data || size == 0 || size > capacity)
                 return buffer;
 
-            if (relay::is_relay_address(from) && proto::has_magic(data, size))
+            if (ipv6::is_gateway_address(from))
+            {
+                // A datagram an IPv6 peer sent us, framed by the gateway:
+                // unwrap it, then it is handled like any direct datagram.
+                sockaddr_in peer{};
+                if (!ipv6::decode_to_game(data, size, peer))
+                {
+                    release_buffer(buffer);
+                    return nullptr;
+                }
+                const std::uint32_t payload = size - static_cast<std::uint32_t>(ipv6::kFrameOverhead);
+                std::memmove(data, data + ipv6::kFrameOverhead, payload);
+                size = payload;
+                from = peer;
+            }
+            else if (relay::is_relay_address(from) && proto::has_magic(data, size))
             {
                 if (data[4] == proto::kVersion && data[5] == static_cast<std::uint8_t>(proto::Type::Recv) &&
                     size >= proto::kDataOverhead)
@@ -618,19 +702,49 @@ namespace ac_relay::game_hooks
             return (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
         }
 
-        void publish_relay_url(const char* stage)
+        [[nodiscard]] void* find_network(const char* stage, const char* what)
         {
-            if (!s_url_ctor || !s_url_dtor || !s_add_local_url_original)
-                return;
-
             void* network = s_network.load();
             if (!network)
                 network = network_from_globals_seh(s_base);
             if (!network)
+                logger::warn(std::format("{}: Quazal::Network instance not found; {} URL not published", stage, what));
+            return network;
+        }
+
+        bool s_published_v6 = false;
+
+        void publish_ipv6_url(const char* stage)
+        {
+            std::string url, vaddr;
+            std::uint16_t port = 0;
+            if (!s_url_ctor || !s_url_dtor || !s_add_local_url_original || !ipv6::local_url(url, vaddr, port))
+                return;
+            void* network = find_network(stage, "IPv6");
+            if (!network)
+                return;
+
+            std::lock_guard lock(s_url_mu);
+            if (add_local_url_seh(s_url_ctor, s_url_dtor, s_add_local_url_original, network, url.c_str()) != 0)
             {
-                logger::warn(std::format("{}: Quazal::Network instance not found; relay URL not published", stage));
+                logger::error(std::format("{}: fault while adding IPv6 URL '{}' -- not published", stage, url));
                 return;
             }
+            if (!s_published_v6)
+            {
+                s_published_v6 = true;
+                logger::info(std::format("{}: published IPv6 URL '{}' as a local station URL", stage, url));
+            }
+        }
+
+        void publish_relay_url(const char* stage)
+        {
+            if (!s_url_ctor || !s_url_dtor || !s_add_local_url_original || !relay::active())
+                return;
+
+            void* network = find_network(stage, "relay");
+            if (!network)
+                return;
 
             std::uint32_t ip = 0;
             std::uint16_t port = 0;
@@ -691,7 +805,15 @@ namespace ac_relay::game_hooks
 
         void mid_prepare_urls(safetyhook::Context& /*ctx*/)
         {
+            publish_ipv6_url("RegisterURLs (SecureConnectionClient::PrepareURLs)");
             publish_relay_url("RegisterURLs (SecureConnectionClient::PrepareURLs)");
+        }
+
+        void mid_url_parse(safetyhook::Context& ctx)
+        {
+            char text[512];
+            if (ctx.ecx && read_url_string_seh(reinterpret_cast<const std::uint8_t*>(ctx.ecx), text, sizeof(text)) == 0)
+                ipv6::learn_url(text);
         }
 
         // Makes sure the relay URL (and the public address the relay sees)
@@ -703,27 +825,44 @@ namespace ac_relay::game_hooks
             if (!s_conninfo_set_url || !station)
                 return;
 
-            std::uint32_t ip = 0;
-            std::uint16_t port = 0;
-            if (!relay::wait_allocation(0, ip, port))
-                return;
-
             struct Wanted
             {
                 std::string address;
                 std::uint16_t port;
+                std::string url; // without RVCID
                 const char* what;
             };
-            std::vector<Wanted> wanted{{ip_text(ip), port, "relay"}};
-            std::uint32_t oip = 0;
-            std::uint16_t oport = 0;
-            if (relay::observed_address(oip, oport))
-                wanted.push_back({ip_text(oip), oport, "public"});
+            const auto plain = [](std::string address, std::uint16_t port, const char* what) {
+                std::string url = std::format("prudp:/address={};port={}", address, port);
+                return Wanted{std::move(address), port, std::move(url), what};
+            };
+
+            // in priority order: the IPv6 URL first (an IPv6 peer behind
+            // CGNAT can reach us on it without the relay)
+            std::vector<Wanted> wanted;
+            {
+                std::string url, vaddr;
+                std::uint16_t v6port = 0;
+                if (ipv6::local_url(url, vaddr, v6port))
+                    wanted.push_back({vaddr, v6port, url, "IPv6"});
+            }
+            std::uint32_t ip = 0;
+            std::uint16_t port = 0;
+            if (relay::active() && relay::wait_allocation(0, ip, port))
+            {
+                wanted.push_back(plain(ip_text(ip), port, "relay"));
+                std::uint32_t oip = 0;
+                std::uint16_t oport = 0;
+                if (relay::observed_address(oip, oport))
+                    wanted.push_back(plain(ip_text(oip), oport, "public"));
+            }
+            if (wanted.empty())
+                return;
 
             SlotText raw[kConnInfoSlots];
             if (read_station_slots_seh(station, raw) != 0)
             {
-                logger::warn("station URLs: fault reading the station's URL slots; relay URL may be missing");
+                logger::warn("station URLs: fault reading the station's URL slots; relay/IPv6 URL may be missing");
                 return;
             }
             std::array<std::string, kConnInfoSlots> slots;
@@ -781,7 +920,7 @@ namespace ac_relay::game_hooks
                     continue;
                 }
 
-                std::string url = std::format("prudp:/address={};port={}", w.address, w.port);
+                std::string url = w.url;
                 if (!rvcid.empty())
                     url += std::format(";RVCID={}", rvcid);
                 if (set_station_slot_seh(s_conninfo_set_url, station, target, url.c_str()) != 0)
@@ -804,6 +943,7 @@ namespace ac_relay::game_hooks
 
         int __fastcall hk_objdup_add_local_urls(void* self, void* /*edx*/, std::uint8_t* station)
         {
+            publish_ipv6_url("station URLs (ObjDupProtocol::AddLocalURLs)");
             publish_relay_url("station URLs (ObjDupProtocol::AddLocalURLs)");
             const int result = s_objdup_add_local_urls_hook.unsafe_thiscall<int>(self, station);
             ensure_station_urls(station);
@@ -897,6 +1037,19 @@ namespace ac_relay::game_hooks
             publish_points += s_objdup_add_local_urls_hook ? 1 : 0;
         }
 
+        // IPv6: learn every peer's v6 URL as the game parses it
+        if (ipv6::active())
+        {
+            if (check_sig(kStationUrlParseRva, kStationUrlParseSig, "StationURL::Parse"))
+                s_url_parse_hook =
+                    safetyhook::create_mid(reinterpret_cast<void*>(s_base + kStationUrlParseRva), mid_url_parse);
+            if (s_url_parse_hook)
+                logger::info(std::format("hooked StationURL::Parse (VA {:#010x}) for IPv6 peer URLs",
+                                         kStationUrlParseRva + kImageBase));
+            else
+                logger::error("StationURL::Parse not hooked: IPv6 peers can't be learned; IPv6 sends will be dropped");
+        }
+
         if (publish_points == 0)
             logger::error("no URL publication hook installed: peers will never learn the relay address");
         else
@@ -910,6 +1063,7 @@ namespace ac_relay::game_hooks
     {
         if (!s_active)
             return;
+        s_url_parse_hook = {};
         s_prepare_urls_hook = {};
         s_objdup_add_local_urls_hook = {};
         s_add_local_url_hook = {};

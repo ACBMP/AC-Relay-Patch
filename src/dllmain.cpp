@@ -2,6 +2,7 @@
 #include "config.h"
 #include "crash_log.h"
 #include "game_hooks.h"
+#include "ipv6.h"
 #include "logger.h"
 #include "relay.h"
 
@@ -40,7 +41,8 @@ namespace
         else
             (void)ac_relay::config::save(); // write a commented default ini
 
-        const auto& settings = ac_relay::config::get().relay;
+        const auto& all = ac_relay::config::get();
+        const auto& settings = all.relay;
 
         if (!ac_relay::logger::initialize(base_path / std::string(LOG_FILENAME), settings.verbose))
             return; // no log, but also nothing else: stay a no-op
@@ -54,13 +56,21 @@ namespace
             return;
         }
 
-        // Resolve the relay before touching the game: unconfigured or
-        // unresolvable = install nothing.
-        if (!ac_relay::relay::initialize(settings))
+        // Set up the relay and the IPv6 path before touching the game:
+        // neither available = install nothing.
+        const bool relay_on = ac_relay::relay::initialize(settings);
+        if (!relay_on)
+            ac_relay::relay::set_one_address_per_peer(settings.one_address_per_peer);
+        const bool ipv6_on = ac_relay::ipv6::initialize(all.ipv6);
+        if (!relay_on && !ipv6_on)
+        {
+            ac_relay::logger::info("neither relay nor IPv6 available; patch is a no-op");
             return;
+        }
 
         if (!ac_relay::game_hooks::initialize())
         {
+            ac_relay::ipv6::shutdown();
             ac_relay::relay::shutdown();
             return;
         }
@@ -96,6 +106,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, [[maybe_unused]
 
     case DLL_PROCESS_DETACH:
         ac_relay::game_hooks::shutdown();
+        ac_relay::ipv6::shutdown();
         ac_relay::relay::shutdown();
         ac_relay::logger::shutdown();
         break;

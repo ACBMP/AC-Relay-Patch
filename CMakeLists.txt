@@ -12,6 +12,7 @@ set(SOURCES
     src/config.cpp
     src/logger.cpp
     src/relay.cpp
+    src/ipv6.cpp
     src/game_hooks.cpp
     src/crash_log.cpp
     external/safetyhook/safetyhook.cpp

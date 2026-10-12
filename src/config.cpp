@@ -64,6 +64,20 @@ namespace ac_relay::config
                 }
             }
 
+            auto& v6 = ini.sections["IPv6"];
+            if (std::string v; inipp::get_value(v6, "Enabled", v))
+                s_settings.ipv6.enabled = parse_bool(v);
+            if (std::string v; inipp::get_value(v6, "Port", v))
+            {
+                try
+                {
+                    s_settings.ipv6.port = std::clamp(std::stoi(v), 0, 65535);
+                }
+                catch (const std::exception&)
+                {
+                }
+            }
+
             return true;
         }
         catch (const std::exception& e)
@@ -97,6 +111,11 @@ namespace ac_relay::config
             file << std::format("RelayProbeDelayMs={}\n", s_settings.relay.relay_probe_delay_ms);
             file << "; keep each peer at one address (drop its second path, e.g. its own relay while it uses ours)\n";
             file << std::format("OneAddressPerPeer={}\n", s_settings.relay.one_address_per_peer ? "true" : "false");
+            file << "\n[IPv6]\n";
+            file << "; reach peers that also have IPv6 directly over IPv6 (no NAT); off by itself without global IPv6\n";
+            file << std::format("Enabled={}\n", s_settings.ipv6.enabled ? "true" : "false");
+            file << "; UDP port for IPv6 (0 = random)\n";
+            file << std::format("Port={}\n", s_settings.ipv6.port);
             return true;
         }
         catch (const std::exception& e)

@@ -32,9 +32,20 @@ namespace ac_relay::config
         bool one_address_per_peer = true;
     };
 
+    struct ipv6_settings
+    {
+        // carry game traffic over IPv6 to peers that also publish an IPv6
+        // URL (docs/IPV6.md); off by itself when the PC has no global IPv6
+        bool enabled = true;
+
+        // UDP port of the IPv6 socket; 0 = random. Taken: falls back to random.
+        int port = 0;
+    };
+
     struct settings
     {
         relay_settings relay;
+        ipv6_settings ipv6;
     };
 
     [[nodiscard]] auto initialize(const std::filesystem::path& config_path) -> bool;
