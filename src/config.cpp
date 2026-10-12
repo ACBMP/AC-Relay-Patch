@@ -67,6 +67,8 @@ namespace ac_relay::config
             auto& v6 = ini.sections["IPv6"];
             if (std::string v; inipp::get_value(v6, "Enabled", v))
                 s_settings.ipv6.enabled = parse_bool(v);
+            if (std::string v; inipp::get_value(v6, "Prefer", v))
+                s_settings.ipv6.prefer = parse_bool(v);
             if (std::string v; inipp::get_value(v6, "Port", v))
             {
                 try
@@ -116,6 +118,8 @@ namespace ac_relay::config
             file << std::format("Enabled={}\n", s_settings.ipv6.enabled ? "true" : "false");
             file << "; UDP port for IPv6 (0 = random)\n";
             file << std::format("Port={}\n", s_settings.ipv6.port);
+            file << "; use only IPv6 to peers that have it (IPv4/relay to them only if IPv6 stays silent for 5 s)\n";
+            file << std::format("Prefer={}\n", s_settings.ipv6.prefer ? "true" : "false");
             return true;
         }
         catch (const std::exception& e)

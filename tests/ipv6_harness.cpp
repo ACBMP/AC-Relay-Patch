@@ -66,6 +66,7 @@ int main(int argc, char** argv)
     const std::string role = argv[1], peer_role = role == "A" ? "B" : "A", dir = argv[2];
 
     config::ipv6_settings cfg;
+    cfg.prefer = true;
     if (!ipv6::initialize(cfg))
         return fail("ipv6::initialize (no global IPv6?)");
 
@@ -143,6 +144,56 @@ int main(int argc, char** argv)
     in[13] ^= 1; // token
     if (ipv6::decode_to_game(in, static_cast<std::size_t>(n), src))
         return fail("frame with a wrong token accepted");
+
+    // ---- Prefer --------------------------------------------------------
+    // the peer's IPv4 URL (same RVCID as its v6 URL): hidden while v6 answers
+    ipv6::learn_url("prudp:/address=198.51.100.9;port=7917;RVCID=305419896");
+    sockaddr_in v4{};
+    v4.sin_family = AF_INET;
+    inet_pton(AF_INET, "198.51.100.9", &v4.sin_addr);
+    v4.sin_port = htons(7917);
+    if (!ipv6::hide_ipv4(v4, "to"))
+        return fail("Prefer: peer's IPv4 URL not hidden");
+    // an IPv4 address only known from a probe naming the same station
+    sockaddr_in probed = v4;
+    inet_pton(AF_INET, "203.0.113.5", &probed.sin_addr);
+    if (ipv6::hide_ipv4(probed, "from"))
+        return fail("Prefer: unknown IPv4 hidden");
+    ipv6::note_probe_sender(probed, 305419896);
+    if (!ipv6::hide_ipv4(probed, "from"))
+        return fail("Prefer: probe-learned IPv4 not hidden");
+    // a station whose IPv6 never answers: its IPv4 comes back after 5 s
+    {
+        in6_addr dead{};
+        inet_pton(AF_INET6, "2001:db8::1", &dead);
+        const std::string hex = "20010db8000000000000000000000001";
+        // its virtual address, computed like ipv6.cpp does (FNV-1a over addr + port)
+        std::uint32_t h = 2166136261u;
+        for (int i = 0; i < 16; ++i) h = (h ^ reinterpret_cast<std::uint8_t*>(&dead)[i]) * 16777619u;
+        h = (h ^ 0x1f) * 16777619u; h = (h ^ 0x2d) * 16777619u; // port 7981
+        const std::uint32_t dv = 0xF0000000u | (h & 0x0FFFFFFFu);
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "prudp:/address=%u.%u.%u.%u;port=7981;v6=%s;RVCID=777", dv >> 24,
+                      (dv >> 16) & 255, (dv >> 8) & 255, dv & 255, hex.c_str());
+        ipv6::learn_url(buf);
+        ipv6::learn_url("prudp:/address=198.51.100.77;port=7917;RVCID=777");
+        sockaddr_in dv4 = v4;
+        inet_pton(AF_INET, "198.51.100.77", &dv4.sin_addr);
+        if (!ipv6::hide_ipv4(dv4, "to"))
+            return fail("Prefer: dead station's IPv4 not hidden at first");
+        sockaddr_in dvaddr{};
+        dvaddr.sin_family = AF_INET;
+        dvaddr.sin_addr.s_addr = htonl(dv);
+        dvaddr.sin_port = htons(7981);
+        ipv6::encode_to_peer(frame, dvaddr);
+        for (int i = 0; i < 14; ++i, Sleep(500)) // 7 s of unanswered "probes"
+            sendto(game, reinterpret_cast<const char*>(frame), static_cast<int>(ipv6::kFrameOverhead + 4), 0,
+                   reinterpret_cast<const sockaddr*>(&gw), sizeof(gw));
+        if (ipv6::hide_ipv4(dv4, "to"))
+            return fail("Prefer: IPv4 still hidden after 7 s of unanswered IPv6");
+    }
+    if (!ipv6::hide_ipv4(v4, "to"))
+        return fail("Prefer: working peer's IPv4 unhidden");
 
     std::printf("PASS %s: got '%s' from %s:%u (peer's virtual address)\n", role.c_str(), got.c_str(),
                 param(peer_url, "address").c_str(), ntohs(src.sin_port));

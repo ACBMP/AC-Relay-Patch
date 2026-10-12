@@ -40,6 +40,11 @@ namespace ac_relay::config
 
         // UDP port of the IPv6 socket; 0 = random. Taken: falls back to random.
         int port = 0;
+
+        // Reach peers that have an IPv6 URL over IPv6 only: their IPv4
+        // addresses (incl. relay URLs) are hidden from the game unless IPv6 to
+        // them stays unanswered for 5 s.
+        bool prefer = false;
     };
 
     struct settings

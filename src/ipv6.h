@@ -61,6 +61,17 @@ namespace ac_relay::ipv6
     // False if inactive.
     [[nodiscard]] auto local_url(std::string& url, std::string& vaddr_text, std::uint16_t& port) -> bool;
 
-    // Every StationURL string the game parses. Cheap reject when it has no v6 param.
+    // Every StationURL string the game parses: v6 URLs give vaddr -> [v6]:port;
+    // with Prefer also the station (RVCID) behind each IPv4 URL.
     auto learn_url(const char* url) -> void;
+
+    // [IPv6] Prefer: addr (network order) is an IPv4 address of a station
+    // that published an IPv6 URL, so the hooks drop traffic to/from it and
+    // the game can only connect over IPv6. False again once IPv6 to that
+    // station stays unanswered for 5 s (fallback to IPv4 / the relay).
+    // direction is only for the log ("to" / "from").
+    // A NAT probe from addr names its sender's RVCID: covers IPv4 URLs that
+    // reached us without one (e.g. from the lobby).
+    auto note_probe_sender(const sockaddr_in& addr, std::uint32_t rvcid) -> void;
+    [[nodiscard]] auto hide_ipv4(const sockaddr_in& addr, const char* direction) -> bool;
 }

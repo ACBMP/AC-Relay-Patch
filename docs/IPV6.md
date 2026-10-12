@@ -137,6 +137,24 @@ can't inject datagrams.
    copy `params["v6"]` when present. The AN-API C# backend is not checked.
    The lobby itself can stay IPv4.
 
+## `[IPv6] Prefer` (default false)
+
+With `Prefer=true`, and when we have IPv6, every IPv4 address of a station
+that published an IPv6 URL is hidden from the game. That covers its interface
+URLs, its public URL and its relay URL. Sends to those addresses go to the sink,
+and traffic from them is dropped, so the game's URL race can only succeed over
+IPv6, and both sides pick the same path. Stations are matched by RVCID: every
+URL a station publishes carries it, and NAT probes carry the sender's RVCID. The
+probes cover IPv4 URLs that arrive without one, e.g. from the lobby.
+
+Fallback: if we have been sending to a station over IPv6 for 5 s without any
+answer, its IPv4 addresses are allowed again (log: `no answer from .. over IPv6
+for 5 s`). The game's connect job may still fail its first attempt in that
+case; its retry then goes over IPv4 or the relay.
+
+Use it to prove the IPv6 path in a test. As a default it needs live data on
+how often IPv6 works between players first.
+
 ## Open / to verify live
 
 - Router v6 firewall behaviour. Not testable from here because patrick.munni.ch

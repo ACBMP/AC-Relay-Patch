@@ -477,7 +477,7 @@ namespace ac_relay::game_hooks
                     !ipv6::is_gateway_address(dest))
                 {
                     sockaddr_in sink{};
-                    if (relay::is_second_address(dest, "to") && sink_address(sink))
+                    if ((relay::is_second_address(dest, "to") || ipv6::hide_ipv4(dest, "to")) && sink_address(sink))
                     {
                         // Can't just skip an overlapped send (the game waits
                         // for it to complete): send it to the relay's control
@@ -597,8 +597,11 @@ namespace ac_relay::game_hooks
                         from.sin_port = htons(peer_port);
                         const ProbeMsg p = parse_probe(data, payload);
                         if (p.ok)
+                        {
                             relay::note_probe_sender(from, p.rvcid);
-                        if (relay::is_second_address(from, "from"))
+                            ipv6::note_probe_sender(from, p.rvcid);
+                        }
+                        if (relay::is_second_address(from, "from") || ipv6::hide_ipv4(from, "from"))
                         {
                             release_buffer(buffer);
                             return nullptr;
@@ -624,8 +627,11 @@ namespace ac_relay::game_hooks
 
             const ProbeMsg p = parse_probe(data, size);
             if (p.ok)
+            {
                 relay::note_probe_sender(from, p.rvcid);
-            if (relay::is_second_address(from, "from"))
+                ipv6::note_probe_sender(from, p.rvcid);
+            }
+            if (relay::is_second_address(from, "from") || ipv6::hide_ipv4(from, "from"))
             {
                 release_buffer(buffer);
                 return nullptr;

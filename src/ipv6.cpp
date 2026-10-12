@@ -49,6 +49,37 @@ namespace ac_relay::ipv6
         std::unordered_map<std::uint32_t, Endpoint> s_map; // vaddr (host order) -> endpoint
         std::unordered_set<std::uint32_t> s_unknown_logged;
 
+        // Prefer: hide the IPv4 addresses of stations that have an IPv6 URL.
+        // All URLs of one station carry its RVCID (ObjDupProtocol::AddLocalURLs
+        // stamps every one), which is what ties a v4 URL to the v6 one.
+        constexpr std::uint64_t kV6SilentMs = 5'000; // sending this long unanswered = v6 path dead
+        struct PathTimes
+        {
+            std::uint64_t first_send = 0, last_send = 0, last_recv = 0; // ms
+        };
+        bool s_prefer = false;
+        std::unordered_map<std::uint32_t, std::uint32_t> s_rvcid_v6;  // RVCID -> vaddr
+        std::unordered_map<std::uint64_t, std::uint32_t> s_v4_rvcid;  // v4 addr:port key -> RVCID
+        std::unordered_map<std::uint32_t, PathTimes> s_times;         // vaddr -> traffic times
+        std::unordered_set<std::uint64_t> s_hidden_logged;
+        std::unordered_set<std::uint32_t> s_dead_logged;              // vaddr
+
+        [[nodiscard]] std::uint64_t v4_key(std::uint32_t ip, std::uint16_t port) // host order
+        {
+            return (static_cast<std::uint64_t>(ip) << 16) | port;
+        }
+
+        // Sending for kV6SilentMs without an answer. Caller holds s_mu.
+        [[nodiscard]] bool v6_dead_locked(std::uint32_t vaddr)
+        {
+            const auto it = s_times.find(vaddr);
+            if (it == s_times.end() || it->second.first_send == 0)
+                return false;
+            const PathTimes& t = it->second;
+            const std::uint64_t base = t.last_recv ? t.last_recv : t.first_send;
+            return t.last_send > base + kV6SilentMs;
+        }
+
         std::atomic<std::uint64_t> s_in_pkts{0}, s_in_bytes{0}, s_out_pkts{0}, s_out_bytes{0};
         std::atomic<std::uint64_t> s_dropped_unknown{0}, s_dropped_bad_frame{0}, s_send_fail{0};
 
@@ -265,6 +296,10 @@ namespace ac_relay::ipv6
                     return;
                 }
                 ep = it->second;
+                PathTimes& t = s_times[vaddr];
+                t.last_send = GetTickCount64();
+                if (t.first_send == 0)
+                    t.first_send = t.last_send;
             }
 
             sockaddr_in6 to{};
@@ -301,6 +336,7 @@ namespace ac_relay::ipv6
             {
                 std::lock_guard lock(s_mu);
                 remember_locked(vaddr, ep, "incoming traffic");
+                s_times[vaddr].last_recv = GetTickCount64();
                 dest = s_game_dest;
             }
             if (dest.sin_port == 0)
@@ -464,6 +500,10 @@ namespace ac_relay::ipv6
         logger::info(std::format("ipv6: listening on {} = virtual {}, gateway 127.0.0.1:{}", endpoint_text(s_self),
                                  ip4_text(s_self_vaddr), ntohs(gw.sin_port)));
 
+        s_prefer = settings.prefer;
+        if (s_prefer)
+            logger::info("ipv6: Prefer=true: peers with an IPv6 URL are reached over IPv6 only "
+                         "(their IPv4 comes back if IPv6 stays unanswered for 5 s)");
         s_stop = false;
         s_active = true;
         std::thread(worker).detach();
@@ -549,12 +589,29 @@ namespace ac_relay::ipv6
 
     auto learn_url(const char* url) -> void
     {
-        if (!url || !s_active.load() || !std::strstr(url, "v6="))
+        if (!url || !s_active.load())
             return;
         const std::string_view text(url);
-        const auto v6 = url_param(text, "v6");
+        const auto v6 = std::strstr(url, "v6=") ? url_param(text, "v6") : std::string_view{};
+
+        // Prefer: remember which station each IPv4 URL belongs to
+        unsigned rvcid = 0;
+        if (s_prefer)
+            if (const auto r = url_param(text, "RVCID"); !r.empty())
+                std::sscanf(std::string(r).c_str(), "%u", &rvcid);
         if (v6.empty())
+        {
+            std::uint32_t ip = 0;
+            unsigned p = 0;
+            if (rvcid != 0 && parse_ip4(url_param(text, "address"), ip) &&
+                std::sscanf(std::string(url_param(text, "port")).c_str(), "%u", &p) == 1 && p != 0 && p <= 0xffff)
+            {
+                std::lock_guard lock(s_mu);
+                if (s_v4_rvcid.size() < kMaxPeers * 4)
+                    s_v4_rvcid[v4_key(ip, static_cast<std::uint16_t>(p))] = rvcid;
+            }
             return;
+        }
 
         Endpoint ep;
         std::uint32_t claimed = 0;
@@ -575,5 +632,45 @@ namespace ac_relay::ipv6
             return;
         }
         remember_locked(vaddr, ep, "station URL");
+        const bool self = std::memcmp(&ep.addr, &s_self.addr, sizeof(in6_addr)) == 0 && ep.port == s_self.port;
+        if (s_prefer && rvcid != 0 && !self && s_rvcid_v6.size() < kMaxPeers)
+            s_rvcid_v6[rvcid] = vaddr;
+    }
+
+    auto note_probe_sender(const sockaddr_in& addr, std::uint32_t rvcid) -> void
+    {
+        if (!s_prefer || !s_active.load() || rvcid == 0 || is_virtual(addr))
+            return;
+        std::lock_guard lock(s_mu);
+        if (s_v4_rvcid.size() < kMaxPeers * 4)
+            s_v4_rvcid[v4_key(ntohl(addr.sin_addr.s_addr), ntohs(addr.sin_port))] = rvcid;
+    }
+
+    auto hide_ipv4(const sockaddr_in& addr, const char* direction) -> bool
+    {
+        if (!s_prefer || !s_active.load() || is_virtual(addr))
+            return false;
+        const std::uint64_t key = v4_key(ntohl(addr.sin_addr.s_addr), ntohs(addr.sin_port));
+        std::lock_guard lock(s_mu);
+        const auto r = s_v4_rvcid.find(key);
+        if (r == s_v4_rvcid.end())
+            return false;
+        const auto v = s_rvcid_v6.find(r->second);
+        if (v == s_rvcid_v6.end())
+            return false;
+        if (v6_dead_locked(v->second))
+        {
+            if (s_dead_logged.insert(v->second).second)
+                logger::warn(std::format("ipv6: no answer from {} over IPv6 for {} s; allowing station RVCID {}'s "
+                                         "IPv4 addresses again",
+                                         ip4_text(v->second), kV6SilentMs / 1000, r->second));
+            return false;
+        }
+        if (s_hidden_logged.insert(key).second && s_hidden_logged.size() < kMaxPeers)
+            logger::info(std::format("ipv6: Prefer: station RVCID {} has IPv6 ({}); dropping traffic {} its IPv4 "
+                                     "address {}:{}",
+                                     r->second, ip4_text(v->second), direction, ip4_text(ntohl(addr.sin_addr.s_addr)),
+                                     ntohs(addr.sin_port)));
+        return true;
     }
 }
