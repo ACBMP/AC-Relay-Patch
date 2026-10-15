@@ -115,6 +115,31 @@ namespace ac_relay::game_hooks
             0x51, 0x56, 0x8b, 0xf1, 0x8b, 0x06, 0xc6, 0x46, 0x78, 0x01, 0x33, 0xc9, 0x89, 0x08, 0x89, 0x48};
         constexpr std::size_t kUrlString = 0x74; // char*
 
+        // Hermes SessionRDV2 handlers (host -> peers session info, two
+        // delegates, identical bodies)  __stdcall(Buffer by value, 0x1c B):
+        //   copy min(size, 0x200) of [arg+0xc, arg+0x10) into a 512 B stack
+        //   buffer; OnlineMenuController::GetInstance()->FUN_005cc3a0(buf, n)
+        // FUN_005cc3a0 -> SessionRDV2::deserialize has no bounds checks, so a
+        // blob over 512 B (long session URLs, e.g. our v6 URL) is parsed on
+        // into the stack and crashes. We replace both with a full-size copy.
+        constexpr std::uintptr_t kSessionInfoHandlerRvas[2] = {0x00652e50 - kImageBase, 0x0084ad60 - kImageBase};
+        constexpr std::array<std::uint8_t, 24> kSessionInfoHandlerSig{
+            0x55, 0x8b, 0xec, 0x8b, 0x45, 0x18, 0x2b, 0x45, 0x14, 0x81, 0xec, 0x00,
+            0x02, 0x00, 0x00, 0x56, 0xbe, 0x00, 0x02, 0x00, 0x00, 0x3d, 0x00, 0x02};
+        // CALL rel32 sites inside each handler, and where they must lead
+        constexpr std::size_t kSessionInfoCallGetInstance = 0x3a;
+        constexpr std::size_t kSessionInfoCallDeserialize = 0x41;
+        constexpr std::size_t kSessionInfoCallArgDtor = 0x49;
+        constexpr std::uintptr_t kOnlineMenuGetInstanceRva = 0x00547c30 - kImageBase; // __cdecl() -> this
+        constexpr std::uintptr_t kSessionInfoDeserializeRva = 0x005cc3a0 - kImageBase; // __thiscall(buf, n), RET 8
+        constexpr std::uintptr_t kSessionInfoArgDtorRva = 0x01ce1450 - kImageBase;     // __thiscall(arg)
+        constexpr std::size_t kSessionInfoArgBegin = 0x0c / 4; // u8* (dword index into the by-value arg)
+        constexpr std::size_t kSessionInfoArgEnd = 0x10 / 4;   // u8*
+        // zeroed tail after the copy: a malformed blob then reads zero
+        // lengths/counts instead of whatever follows on the heap
+        constexpr std::size_t kSessionInfoSlack = 1024;
+        constexpr std::size_t kSessionInfoMax = 64 * 1024;
+
         // Network::GetInstance() is inlined everywhere as:
         //   if (!g_multiContext) net = g_networkHolder ? g_networkHolder->[+0xc] : 0
         constexpr std::uintptr_t kMultiContextFlagRva = 0x0268964c - kImageBase; // u8
@@ -148,6 +173,9 @@ namespace ac_relay::game_hooks
         using AddLocalUrlFn = void(__thiscall*)(void* network, const void* url);
         using ConnInfoSetUrlFn = void(__thiscall*)(void* conninfo, int slot, const char* url);
         using BufferReleaseFn = void(__thiscall*)(void* buffer);
+        using GetInstanceFn = void*(__cdecl*)();
+        using SessionInfoDeserializeFn = void(__thiscall*)(void* self, const std::uint8_t* data, std::uint32_t size);
+        using SessionInfoArgDtorFn = void(__thiscall*)(void* arg);
 
         std::uintptr_t s_base = 0;
         bool s_active = false;
@@ -158,6 +186,10 @@ namespace ac_relay::game_hooks
         SafetyHookMid s_prepare_urls_hook{};
         SafetyHookInline s_objdup_add_local_urls_hook{};
         SafetyHookMid s_url_parse_hook{};
+        SafetyHookInline s_session_info_hooks[2]{};
+        GetInstanceFn s_online_menu_get_instance = nullptr;
+        SessionInfoDeserializeFn s_session_info_deserialize = nullptr;
+        SessionInfoArgDtorFn s_session_info_arg_dtor = nullptr;
 
         StationUrlCtorFn s_url_ctor = nullptr;
         StationUrlDtorFn s_url_dtor = nullptr;
@@ -947,6 +979,76 @@ namespace ac_relay::game_hooks
                     logger::debug(std::format("station URL slot {}: '{}'", i, slots[i]));
         }
 
+        // ---- SessionRDV2 handlers: no 512 B cap -------------------------------
+        struct SessionInfoArg
+        {
+            std::uint32_t d[7]; // the game's Buffer, passed by value (callee destroys it)
+        };
+
+        void __stdcall hk_session_info(SessionInfoArg arg)
+        {
+            const auto* begin = reinterpret_cast<const std::uint8_t*>(arg.d[kSessionInfoArgBegin]);
+            const auto* end = reinterpret_cast<const std::uint8_t*>(arg.d[kSessionInfoArgEnd]);
+            std::size_t size = end > begin ? static_cast<std::size_t>(end - begin) : 0;
+            if (size > kSessionInfoMax)
+            {
+                logger::warn(std::format("session info: {} B blob, truncated to {} B", size, kSessionInfoMax));
+                size = kSessionInfoMax;
+            }
+            if (size > 0x200 && logger::verbose())
+                logger::debug(std::format("session info: {} B blob (vanilla would cut it at 512 B)", size));
+
+            std::vector<std::uint8_t> buf(size + kSessionInfoSlack, 0);
+            if (size)
+                std::memcpy(buf.data(), begin, size);
+            s_session_info_deserialize(s_online_menu_get_instance(), buf.data(), static_cast<std::uint32_t>(size));
+            s_session_info_arg_dtor(&arg);
+        }
+
+        [[nodiscard]] std::uintptr_t call_target_rva(std::uintptr_t rva, std::size_t offset)
+        {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(s_base + rva + offset);
+            if (p[0] != 0xe8)
+                return 0;
+            std::int32_t rel = 0;
+            std::memcpy(&rel, p + 1, 4);
+            return rva + offset + 5 + static_cast<std::uintptr_t>(rel);
+        }
+
+        void install_session_info_hooks()
+        {
+            int installed = 0;
+            for (int i = 0; i < 2; ++i)
+            {
+                const std::uintptr_t rva = kSessionInfoHandlerRvas[i];
+                const auto what = std::format("SessionRDV2 handler {}", i + 1);
+                if (!check_sig(rva, kSessionInfoHandlerSig, what.c_str()))
+                    continue;
+                if (call_target_rva(rva, kSessionInfoCallGetInstance) != kOnlineMenuGetInstanceRva ||
+                    call_target_rva(rva, kSessionInfoCallDeserialize) != kSessionInfoDeserializeRva ||
+                    call_target_rva(rva, kSessionInfoCallArgDtor) != kSessionInfoArgDtorRva)
+                {
+                    logger::warn(std::format("{} (VA {:#010x}) calls something else; not hooked", what,
+                                             rva + kImageBase));
+                    continue;
+                }
+                s_online_menu_get_instance = reinterpret_cast<GetInstanceFn>(s_base + kOnlineMenuGetInstanceRva);
+                s_session_info_deserialize =
+                    reinterpret_cast<SessionInfoDeserializeFn>(s_base + kSessionInfoDeserializeRva);
+                s_session_info_arg_dtor = reinterpret_cast<SessionInfoArgDtorFn>(s_base + kSessionInfoArgDtorRva);
+                s_session_info_hooks[i] = safetyhook::create_inline(reinterpret_cast<void*>(s_base + rva),
+                                                                    reinterpret_cast<void*>(&hk_session_info));
+                installed += s_session_info_hooks[i] ? 1 : 0;
+            }
+            if (installed == 2)
+                logger::info("hooked the SessionRDV2 handlers (VA 0x00652e50, 0x0084ad60): no 512 B cap on the "
+                             "host's session info");
+            else
+                logger::warn(std::format("SessionRDV2 handlers hooked: {}/2; session info over 512 B (long session "
+                                         "URLs) can crash this game",
+                                         installed));
+        }
+
         int __fastcall hk_objdup_add_local_urls(void* self, void* /*edx*/, std::uint8_t* station)
         {
             publish_ipv6_url("station URLs (ObjDupProtocol::AddLocalURLs)");
@@ -1043,6 +1145,10 @@ namespace ac_relay::game_hooks
             publish_points += s_objdup_add_local_urls_hook ? 1 : 0;
         }
 
+        // our URLs (v6, relay) make the host's session info longer than the
+        // game's 512 B receive buffer
+        install_session_info_hooks();
+
         // IPv6: learn every peer's v6 URL as the game parses it
         if (ipv6::active())
         {
@@ -1069,6 +1175,8 @@ namespace ac_relay::game_hooks
     {
         if (!s_active)
             return;
+        for (auto& h : s_session_info_hooks)
+            h = {};
         s_url_parse_hook = {};
         s_prepare_urls_hook = {};
         s_objdup_add_local_urls_hook = {};
