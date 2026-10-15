@@ -140,6 +140,12 @@ namespace ac_relay::game_hooks
         // lengths/counts instead of whatever follows on the heap
         constexpr std::size_t kSessionInfoSlack = 1024;
         constexpr std::size_t kSessionInfoMax = 64 * 1024;
+        // the host's sender (FUN_011c5030, case for the session-info event):
+        // right after SessionRDV2::serialize(buf=EBX, size=EDI) and before the
+        // send through vtable +0xb0/+0xb4. MOV ECX,[0x025a4418]; MOV EAX,[ECX+0x10]; CMP EAX,4
+        constexpr std::uintptr_t kSessionInfoSendRva = 0x011c52e5 - kImageBase;
+        constexpr std::array<std::uint8_t, 12> kSessionInfoSendSig{0x8b, 0x0d, 0x18, 0x44, 0x5a, 0x02,
+                                                                    0x8b, 0x41, 0x10, 0x83, 0xf8, 0x04};
 
         // Network::GetInstance() is inlined everywhere as:
         //   if (!g_multiContext) net = g_networkHolder ? g_networkHolder->[+0xc] : 0
@@ -188,6 +194,7 @@ namespace ac_relay::game_hooks
         SafetyHookInline s_objdup_add_local_urls_hook{};
         SafetyHookMid s_url_parse_hook{};
         SafetyHookInline s_session_info_hooks[2]{};
+        SafetyHookMid s_session_info_send_hook{};
         GetInstanceFn s_online_menu_get_instance = nullptr;
         SessionInfoDeserializeFn s_session_info_deserialize = nullptr;
         SessionInfoArgDtorFn s_session_info_arg_dtor = nullptr;
@@ -1104,8 +1111,34 @@ namespace ac_relay::game_hooks
             return rva + offset + 5 + static_cast<std::uintptr_t>(rel);
         }
 
+        // host side: the blob as it leaves this game, checked the same way, so a
+        // malformed one shows whether the sender or the way there broke it
+        void mid_session_info_send(safetyhook::Context& ctx)
+        {
+            const auto* buf = reinterpret_cast<const std::uint8_t*>(ctx.ebx);
+            const std::size_t size = ctx.edi;
+            if (!buf || size == 0 || size > kSessionInfoMax)
+            {
+                logger::warn(std::format("session info (sending): buffer {:#010x}, {} B; not checked", ctx.ebx, size));
+                return;
+            }
+            std::size_t used = 0;
+            if (const auto problem = check_session_info(buf, size, used); !problem.empty())
+            {
+                logger::error(std::format("session info (sending): {} B blob is malformed ({})", size, problem));
+                log_hex(buf, size);
+            }
+            else
+                logger::info(std::format("session info (sending): {} B blob{}", size,
+                                         used != size ? std::format(", {} B unread after it", size - used) : ""));
+        }
+
         void install_session_info_hooks()
         {
+            if (check_sig(kSessionInfoSendRva, kSessionInfoSendSig, "SessionRDV2 sender", {2}))
+                s_session_info_send_hook = safetyhook::create_mid(reinterpret_cast<void*>(s_base + kSessionInfoSendRva),
+                                                                  mid_session_info_send);
+
             int installed = 0;
             for (int i = 0; i < 2; ++i)
             {
@@ -1264,6 +1297,7 @@ namespace ac_relay::game_hooks
     {
         if (!s_active)
             return;
+        s_session_info_send_hook = {};
         for (auto& h : s_session_info_hooks)
             h = {};
         s_url_parse_hook = {};
