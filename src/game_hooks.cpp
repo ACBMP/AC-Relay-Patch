@@ -10,6 +10,7 @@
 
 #include <safetyhook.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -985,6 +986,77 @@ namespace ac_relay::game_hooks
             std::uint32_t d[7]; // the game's Buffer, passed by value (callee destroys it)
         };
 
+        // Walks a SessionRDV2 blob the way the game reads it (MatchmakingParameterBlock::
+        // deserialize, then SessionRDV2's 14 B header and URLs), with bounds checks the
+        // game does not have. Returns "" when it is well-formed, else what is wrong;
+        // used is how many bytes the game will read (it ignores any rest).
+        [[nodiscard]] std::string check_session_info(const std::uint8_t* p, std::size_t size, std::size_t& used)
+        {
+            std::size_t at = 0;
+            auto take = [&](std::size_t n) { return size - at >= n ? (at += n, true) : false; };
+            auto u32 = [&](std::uint32_t& v) {
+                if (size - at < 4)
+                    return false;
+                std::memcpy(&v, p + at, 4);
+                at += 4;
+                return true;
+            };
+
+            std::uint32_t params = 0;
+            if (!u32(params))
+                return "no parameter count";
+            for (std::uint32_t i = 0; i < params; ++i)
+            {
+                const std::size_t entry = at;
+                std::uint32_t id = 0;
+                if (!u32(id) || !take(1))
+                    return std::format("parameter {}/{} at +{:#x}: truncated", i, params, entry);
+                const std::uint8_t type = p[at - 1];
+                std::uint32_t len = 0;
+                bool ok = true;
+                switch (type)
+                {
+                case 1:
+                case 3: ok = take(4); break;
+                case 2:
+                case 4: ok = take(8); break;
+                case 5: ok = u32(len) && take(len); break;
+                default: break;
+                }
+                if (!ok)
+                    return std::format("parameter {}/{} (id {:#x}, type {}, len {}) at +{:#x}: runs past the end",
+                                       i, params, id, type, len, entry);
+            }
+            const std::size_t header = at;
+            if (!take(14))
+                return std::format("session header at +{:#x}: truncated ({} parameters)", header, params);
+            const std::uint8_t urls = p[at - 1];
+            for (std::uint8_t i = 0; i < urls; ++i)
+            {
+                const std::size_t entry = at;
+                if (!take(1) || !take(std::size_t{p[at - 1]} + 1))
+                    return std::format("URL {}/{} at +{:#x}: runs past the end", i, urls, entry);
+            }
+            used = at;
+            return {};
+        }
+
+        void log_hex(const std::uint8_t* p, std::size_t size)
+        {
+            constexpr std::size_t kMaxDump = 4096;
+            for (std::size_t row = 0; row < std::min(size, kMaxDump); row += 32)
+            {
+                std::string line = std::format("    {:04x}:", row);
+                std::string text;
+                for (std::size_t i = row; i < std::min({row + 32, size, kMaxDump}); ++i)
+                {
+                    line += std::format(" {:02x}", p[i]);
+                    text += p[i] >= 0x20 && p[i] < 0x7f ? static_cast<char>(p[i]) : '.';
+                }
+                logger::info(line + "  " + text);
+            }
+        }
+
         void __stdcall hk_session_info(SessionInfoArg arg)
         {
             const auto* begin = reinterpret_cast<const std::uint8_t*>(arg.d[kSessionInfoArgBegin]);
@@ -995,13 +1067,30 @@ namespace ac_relay::game_hooks
                 logger::warn(std::format("session info: {} B blob, truncated to {} B", size, kSessionInfoMax));
                 size = kSessionInfoMax;
             }
-            if (size > 0x200 && logger::verbose())
-                logger::debug(std::format("session info: {} B blob (vanilla would cut it at 512 B)", size));
 
             std::vector<std::uint8_t> buf(size + kSessionInfoSlack, 0);
             if (size)
                 std::memcpy(buf.data(), begin, size);
-            s_session_info_deserialize(s_online_menu_get_instance(), buf.data(), static_cast<std::uint32_t>(size));
+
+            // the game trusts every length in the blob; a malformed one used
+            // to kill the process (invalid-parameter abort in memcpy_s), so
+            // drop it and keep the bytes for diagnosis instead
+            std::size_t used = 0;
+            if (const auto problem = check_session_info(buf.data(), size, used); !problem.empty())
+            {
+                logger::error(std::format("session info: {} B blob is malformed ({}); dropped, not passed to the "
+                                          "game. arg dwords: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                                          size, problem, arg.d[0], arg.d[1], arg.d[2], arg.d[3], arg.d[4],
+                                          arg.d[5], arg.d[6]));
+                log_hex(buf.data(), size);
+            }
+            else
+            {
+                logger::info(std::format("session info: {} B blob{}{}", size,
+                                         size > 0x200 ? " (vanilla would cut it at 512 B)" : "",
+                                         used != size ? std::format(", {} B unread after it", size - used) : ""));
+                s_session_info_deserialize(s_online_menu_get_instance(), buf.data(), static_cast<std::uint32_t>(size));
+            }
             s_session_info_arg_dtor(&arg);
         }
 
