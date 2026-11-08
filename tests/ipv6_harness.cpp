@@ -3,6 +3,8 @@
 //
 //   ipv6_harness.exe A <dir>  &  ipv6_harness.exe B <dir>
 //
+// A third argument "headstart" tests HeadStartMs (Prefer off) instead of Prefer.
+//
 // Each process plays one station: a UDP "game socket" on 0.0.0.0, the IPv6
 // module, its URL written to <dir>/<role>.url. It learns the other's URL
 // the way the StationURL::Parse hook would (with the RVCID the game appends),
@@ -38,6 +40,15 @@ namespace ac_relay::logger
     auto error(std::string_view m) -> void { std::printf("  [error] %.*s\n", (int)m.size(), m.data()); }
 }
 
+namespace ac_relay::relay
+{
+    sockaddr_in g_pinned{}; // the address the test pretends a station is connected at
+    auto is_pinned_address(const sockaddr_in& a) -> bool
+    {
+        return a.sin_addr.s_addr == g_pinned.sin_addr.s_addr && a.sin_port == g_pinned.sin_port;
+    }
+}
+
 namespace
 {
     std::string param(const std::string& url, const std::string& key)
@@ -61,12 +72,13 @@ int main(int argc, char** argv)
 {
     using namespace ac_relay;
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc != 3)
-        return fail("usage: ipv6_harness A|B <dir>");
+    if (argc != 3 && argc != 4)
+        return fail("usage: ipv6_harness A|B <dir> [headstart]");
     const std::string role = argv[1], peer_role = role == "A" ? "B" : "A", dir = argv[2];
+    const bool head_start = argc == 4 && std::string_view(argv[3]) == "headstart";
 
     config::ipv6_settings cfg;
-    cfg.prefer = true;
+    cfg.prefer = !head_start;
     if (!ipv6::initialize(cfg))
         return fail("ipv6::initialize (no global IPv6?)");
 
@@ -145,7 +157,7 @@ int main(int argc, char** argv)
     if (ipv6::decode_to_game(in, static_cast<std::size_t>(n), src))
         return fail("frame with a wrong token accepted");
 
-    // ---- Prefer --------------------------------------------------------
+    // ---- Prefer / head start ------------------------------------------
     // the peer's IPv4 URL (same RVCID as its v6 URL): hidden while v6 answers
     ipv6::learn_url("prudp:/address=198.51.100.9;port=7917;RVCID=305419896");
     sockaddr_in v4{};
@@ -186,14 +198,25 @@ int main(int argc, char** argv)
         dvaddr.sin_addr.s_addr = htonl(dv);
         dvaddr.sin_port = htons(7981);
         ipv6::encode_to_peer(frame, dvaddr);
-        for (int i = 0; i < 14; ++i, Sleep(500)) // 7 s of unanswered "probes"
+        // 7 s of unanswered "probes" (Prefer), 2 s with a 1.5 s head start
+        for (int i = 0; i < (head_start ? 4 : 14); ++i, Sleep(500))
             sendto(game, reinterpret_cast<const char*>(frame), static_cast<int>(ipv6::kFrameOverhead + 4), 0,
                    reinterpret_cast<const sockaddr*>(&gw), sizeof(gw));
         if (ipv6::hide_ipv4(dv4, "to"))
-            return fail("Prefer: IPv4 still hidden after 7 s of unanswered IPv6");
+            return fail("IPv4 still hidden after unanswered IPv6");
+        if (head_start && ipv6::hide_ipv4(dv4, "to"))
+            return fail("head start: IPv4 hidden again after it joined the race");
     }
     if (!ipv6::hide_ipv4(v4, "to"))
-        return fail("Prefer: working peer's IPv4 unhidden");
+        return fail("working peer's IPv4 unhidden");
+    if (head_start)
+    {
+        // an IPv4 connection the game already runs is never cut
+        relay::g_pinned = v4;
+        if (ipv6::hide_ipv4(v4, "to"))
+            return fail("head start: pinned IPv4 connection hidden");
+        relay::g_pinned = {};
+    }
 
     std::printf("PASS %s: got '%s' from %s:%u (peer's virtual address)\n", role.c_str(), got.c_str(),
                 param(peer_url, "address").c_str(), ntohs(src.sin_port));

@@ -1,5 +1,6 @@
 #include "ipv6.h"
 #include "logger.h"
+#include "relay.h"
 
 #include <WS2tcpip.h>
 #include <Windows.h>
@@ -49,15 +50,19 @@ namespace ac_relay::ipv6
         std::unordered_map<std::uint32_t, Endpoint> s_map; // vaddr (host order) -> endpoint
         std::unordered_set<std::uint32_t> s_unknown_logged;
 
-        // Prefer: hide the IPv4 addresses of stations that have an IPv6 URL.
-        // All URLs of one station carry its RVCID (ObjDupProtocol::AddLocalURLs
-        // stamps every one), which is what ties a v4 URL to the v6 one.
+        // Prefer / head start: hide the IPv4 addresses of stations that have
+        // an IPv6 URL. All URLs of one station carry its RVCID
+        // (ObjDupProtocol::AddLocalURLs stamps every one), which is what ties
+        // a v4 URL to the v6 one.
         constexpr std::uint64_t kV6SilentMs = 5'000; // sending this long unanswered = v6 path dead
         struct PathTimes
         {
+            std::uint64_t learned = 0; // ms; its v6 URL was first seen
             std::uint64_t first_send = 0, last_send = 0, last_recv = 0; // ms
         };
         bool s_prefer = false;
+        std::uint64_t s_head_start_ms = 0;
+        std::unordered_set<std::uint32_t> s_head_start_over; // RVCIDs whose IPv4 may race again
         std::unordered_map<std::uint32_t, std::uint32_t> s_rvcid_v6;  // RVCID -> vaddr
         std::unordered_map<std::uint64_t, std::uint32_t> s_v4_rvcid;  // v4 addr:port key -> RVCID
         std::unordered_map<std::uint32_t, PathTimes> s_times;         // vaddr -> traffic times
@@ -67,6 +72,12 @@ namespace ac_relay::ipv6
         [[nodiscard]] std::uint64_t v4_key(std::uint32_t ip, std::uint16_t port) // host order
         {
             return (static_cast<std::uint64_t>(ip) << 16) | port;
+        }
+
+        // Station URLs are matched to RVCIDs only when something hides IPv4.
+        [[nodiscard]] bool tracking()
+        {
+            return s_prefer || s_head_start_ms != 0;
         }
 
         // Sending for kV6SilentMs without an answer. Caller holds s_mu.
@@ -501,9 +512,14 @@ namespace ac_relay::ipv6
                                  ip4_text(s_self_vaddr), ntohs(gw.sin_port)));
 
         s_prefer = settings.prefer;
+        s_head_start_ms = static_cast<std::uint64_t>(settings.head_start_ms);
         if (s_prefer)
             logger::info("ipv6: Prefer=true: peers with an IPv6 URL are reached over IPv6 only "
                          "(their IPv4 comes back if IPv6 stays unanswered for 5 s)");
+        else if (s_head_start_ms != 0)
+            logger::info(std::format("ipv6: HeadStartMs={}: peers with an IPv6 URL get IPv6 first; their IPv4 "
+                                     "joins the race if IPv6 stays unanswered that long",
+                                     s_head_start_ms));
         s_stop = false;
         s_active = true;
         std::thread(worker).detach();
@@ -596,7 +612,7 @@ namespace ac_relay::ipv6
 
         // Prefer: remember which station each IPv4 URL belongs to
         unsigned rvcid = 0;
-        if (s_prefer)
+        if (tracking())
             if (const auto r = url_param(text, "RVCID"); !r.empty())
                 std::sscanf(std::string(r).c_str(), "%u", &rvcid);
         if (v6.empty())
@@ -633,13 +649,17 @@ namespace ac_relay::ipv6
         }
         remember_locked(vaddr, ep, "station URL");
         const bool self = std::memcmp(&ep.addr, &s_self.addr, sizeof(in6_addr)) == 0 && ep.port == s_self.port;
-        if (s_prefer && rvcid != 0 && !self && s_rvcid_v6.size() < kMaxPeers)
+        if (tracking() && rvcid != 0 && !self && s_rvcid_v6.size() < kMaxPeers)
+        {
             s_rvcid_v6[rvcid] = vaddr;
+            if (auto& t = s_times[vaddr]; t.learned == 0)
+                t.learned = GetTickCount64();
+        }
     }
 
     auto note_probe_sender(const sockaddr_in& addr, std::uint32_t rvcid) -> void
     {
-        if (!s_prefer || !s_active.load() || rvcid == 0 || is_virtual(addr))
+        if (!tracking() || !s_active.load() || rvcid == 0 || is_virtual(addr))
             return;
         std::lock_guard lock(s_mu);
         if (s_v4_rvcid.size() < kMaxPeers * 4)
@@ -648,7 +668,10 @@ namespace ac_relay::ipv6
 
     auto hide_ipv4(const sockaddr_in& addr, const char* direction) -> bool
     {
-        if (!s_prefer || !s_active.load() || is_virtual(addr))
+        if (!tracking() || !s_active.load() || is_virtual(addr))
+            return false;
+        // Head start never cuts a connection the game already runs over IPv4.
+        if (!s_prefer && relay::is_pinned_address(addr))
             return false;
         const std::uint64_t key = v4_key(ntohl(addr.sin_addr.s_addr), ntohs(addr.sin_port));
         std::lock_guard lock(s_mu);
@@ -666,11 +689,35 @@ namespace ac_relay::ipv6
                                          ip4_text(v->second), kV6SilentMs / 1000, r->second));
             return false;
         }
+        if (!s_prefer)
+        {
+            // Head start: IPv4 waits until IPv6 has had its chance. Once that
+            // runs out unanswered, IPv4 stays allowed for this station, so a
+            // late IPv6 answer can't take an IPv4 connection away.
+            if (s_head_start_over.contains(r->second))
+                return false;
+            const auto t = s_times.find(v->second);
+            const bool answered = t != s_times.end() && t->second.last_recv != 0;
+            if (!answered)
+            {
+                const std::uint64_t since =
+                    t == s_times.end() ? 0 : (t->second.first_send ? t->second.first_send : t->second.learned);
+                if (since == 0 || GetTickCount64() - since >= s_head_start_ms)
+                {
+                    if (s_head_start_over.size() < kMaxPeers)
+                        s_head_start_over.insert(r->second);
+                    logger::info(std::format("ipv6: no answer from {} over IPv6 within {} ms; station RVCID {}'s "
+                                             "IPv4 addresses join the race",
+                                             ip4_text(v->second), s_head_start_ms, r->second));
+                    return false;
+                }
+            }
+        }
         if (s_hidden_logged.insert(key).second && s_hidden_logged.size() < kMaxPeers)
-            logger::info(std::format("ipv6: Prefer: station RVCID {} has IPv6 ({}); dropping traffic {} its IPv4 "
+            logger::info(std::format("ipv6: {}: station RVCID {} has IPv6 ({}); dropping traffic {} its IPv4 "
                                      "address {}:{}",
-                                     r->second, ip4_text(v->second), direction, ip4_text(ntohl(addr.sin_addr.s_addr)),
-                                     ntohs(addr.sin_port)));
+                                     s_prefer ? "Prefer" : "head start", r->second, ip4_text(v->second), direction,
+                                     ip4_text(ntohl(addr.sin_addr.s_addr)), ntohs(addr.sin_port)));
         return true;
     }
 }

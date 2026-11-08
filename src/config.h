@@ -45,6 +45,12 @@ namespace ac_relay::config
         // addresses (incl. relay URLs) are hidden from the game unless IPv6 to
         // them stays unanswered for 5 s.
         bool prefer = false;
+
+        // Without Prefer: a station's IPv4 addresses are hidden for this long
+        // after IPv6 to it starts (and for good once it answers), so IPv6 wins
+        // the game's URL race when it works. Never drops a connection already
+        // running over IPv4. 0 = off.
+        int head_start_ms = 1500;
     };
 
     struct settings

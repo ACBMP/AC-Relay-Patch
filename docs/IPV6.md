@@ -155,6 +155,31 @@ case; its retry then goes over IPv4 or the relay.
 Use it to prove the IPv6 path in a test. As a default it needs live data on
 how often IPv6 works between players first.
 
+## `[IPv6] HeadStartMs` (default 1500, used when Prefer is off)
+
+Without it, IPv6 has to win the game's URL race against the peer's IPv4 URLs
+on its own, and `OneAddressPerPeer` pins whichever address carries
+connection traffic first. A direct IPv4 hole punch often gets there a few
+hundred ms ahead, and once the IPv6 address is pinned out, it stays out even
+after the IPv4 path drops to the relay.
+
+The head start hides a station's IPv4 addresses the same way Prefer does, but
+only for a short time:
+
+- From the moment we first send to the station over IPv6 (or, until then,
+  from when its IPv6 URL was parsed), its IPv4 stays hidden for `HeadStartMs`.
+- If IPv6 answers in that window, IPv4 stays hidden, as with Prefer. The 5 s
+  silence fallback still applies.
+- If it doesn't, the station's IPv4 addresses join the race (log: `no answer
+  from .. over IPv6 within .. ms`) and stay allowed for the session, so a late
+  IPv6 answer can't take an IPv4 connection away.
+- An address the station is already connected at (its `OneAddressPerPeer` pin)
+  is never hidden. A head start that begins mid-session, such as when an IPv6
+  URL arrives after the IPv4 connection is up, cannot break that connection.
+
+It never moves an existing pin from IPv4 to IPv6. Moving it would drop the
+game's running IPv4 connection to that station.
+
 ## Open / to verify live
 
 - Router v6 firewall behaviour. Not testable from here because patrick.munni.ch

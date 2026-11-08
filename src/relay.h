@@ -83,6 +83,8 @@ namespace ac_relay::relay
     // True if addr is a second address of a station connected elsewhere.
     // direction is only used for the log line ("to" / "from").
     [[nodiscard]] auto is_second_address(const sockaddr_in& addr, const char* direction) -> bool;
+    // True if addr is the address its station is connected at right now.
+    [[nodiscard]] auto is_pinned_address(const sockaddr_in& addr) -> bool;
 
     // Current allocation (host-order ip/port). If none exists yet and an
     // ALLOCATE is in flight, waits up to timeout_ms for ALLOCATED.

@@ -69,6 +69,16 @@ namespace ac_relay::config
                 s_settings.ipv6.enabled = parse_bool(v);
             if (std::string v; inipp::get_value(v6, "Prefer", v))
                 s_settings.ipv6.prefer = parse_bool(v);
+            if (std::string v; inipp::get_value(v6, "HeadStartMs", v))
+            {
+                try
+                {
+                    s_settings.ipv6.head_start_ms = std::clamp(std::stoi(v), 0, 5000);
+                }
+                catch (const std::exception&)
+                {
+                }
+            }
             if (std::string v; inipp::get_value(v6, "Port", v))
             {
                 try
@@ -120,6 +130,8 @@ namespace ac_relay::config
             file << std::format("Port={}\n", s_settings.ipv6.port);
             file << "; use only IPv6 to peers that have it (IPv4/relay to them only if IPv6 stays silent for 5 s)\n";
             file << std::format("Prefer={}\n", s_settings.ipv6.prefer ? "true" : "false");
+            file << "; without Prefer: hide a peer's IPv4 this long (ms) while IPv6 to it gets a chance; 0 = off\n";
+            file << std::format("HeadStartMs={}\n", s_settings.ipv6.head_start_ms);
             return true;
         }
         catch (const std::exception& e)

@@ -854,6 +854,20 @@ namespace ac_relay::relay
         return true;
     }
 
+    auto is_pinned_address(const sockaddr_in& addr) -> bool
+    {
+        std::lock_guard lock(s_mu);
+        if (!s_one_address)
+            return false;
+        const std::uint64_t key = peer_key(addr);
+        const auto r = s_addr_rvcid.find(key);
+        if (r == s_addr_rvcid.end())
+            return false;
+        const auto it = s_stations.find(r->second);
+        return it != s_stations.end() && it->second.addr == key &&
+               now_ms() - it->second.last_session < kStationAliveMs;
+    }
+
     auto note_relay_send(const sockaddr_in& peer, std::size_t payload_len) -> void
     {
         ++s_relay_out_pkts;
