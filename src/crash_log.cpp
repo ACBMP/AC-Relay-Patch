@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -89,8 +90,15 @@ namespace ac_relay::crash_log
             int hits = 0;
             __try
             {
+                // Stop at the top of this thread's stack: reading past it
+                // faults, and that fault gets logged as a second exception.
+                const auto stack_top = reinterpret_cast<std::uintptr_t>(
+                    reinterpret_cast<const NT_TIB*>(NtCurrentTeb())->StackBase);
+                const int limit = esp < stack_top
+                    ? static_cast<int>((std::min<std::uintptr_t>)((stack_top - esp) / 4, kStackScanDwords))
+                    : 0;
                 const auto* p = reinterpret_cast<const std::uintptr_t*>(esp);
-                for (int i = 0; i < kStackScanDwords && hits < max; ++i)
+                for (int i = 0; i < limit && hits < max; ++i)
                 {
                     const std::uintptr_t v = p[i];
                     if (v < 0x10000)
